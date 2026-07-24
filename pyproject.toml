@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuvis-ai-rfdetr"
+version = "0.1.0"
+description = "RF-DETR (Roboflow, Apache-2.0 tier) object detection as a cuvis.ai plugin node."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+    { name = "Cubert GmbH, Ulm, Germany", email = "cuvis.ai@cubert-gmbh.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Operating System :: OS Independent",
+]
+keywords = [
+    "cuvis",
+    "hyperspectral",
+    "rf-detr",
+    "object-detection",
+    "foreign-object-detection",
+    "anomaly-detection",
+    "plugin",
+    "cuvis-ai",
+]
+dependencies = [
+    # Note: do NOT depend on the high-level `cuvis-ai` package — plugins target
+    # cuvis-ai-core + cuvis-ai-schemas only (matching the sibling plugins).
+    "cuvis-ai-core>=0.11.2",
+    "cuvis-ai-schemas>=0.8.0",
+    # Official Roboflow RF-DETR, core (inference) tier only — deliberately NOT
+    # rfdetr[train]; fine-tuning happens outside the pipeline graph.
+    "rfdetr>=1.8,<2",
+    "torch>=2.2",
+    "numpy",
+    "supervision>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://www.cubert-hyperspectral.com/"
+Repository = "https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr"
+Issues = "https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr/issues"
+
+[tool.setuptools.packages.find]
+include = ["cuvis_ai_rfdetr*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# Allows running the tests from a fresh checkout without installing the
+# package (the suite needs only cuvis-ai-core, cuvis-ai-schemas and torch).
+pythonpath = ["."]
+markers = [
+    "integration: exercises the cuvis-ai-core plugin loader",
+]
+
+[tool.coverage.run]
+source = ["cuvis_ai_rfdetr"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true

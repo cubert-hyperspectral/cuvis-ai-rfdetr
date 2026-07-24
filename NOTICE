@@ -1,0 +1,9 @@
+cuvis-ai-rfdetr
+Copyright 2026 Cubert GmbH, Ulm, Germany
+
+This product wraps RF-DETR (https://github.com/roboflow/rf-detr),
+Copyright Roboflow, Inc., licensed under the Apache License, Version 2.0.
+Only the Apache-2.0 model tier (nano / small / medium / large) is used.
+The RF-DETR XL / 2XL checkpoints are distributed under the non-open
+Roboflow Platform Model License and are not included, wrapped, or
+downloaded by this package.
