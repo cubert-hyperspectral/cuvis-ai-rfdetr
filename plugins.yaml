@@ -1,0 +1,8 @@
+# Local plugin manifest (path resolved relative to this file).
+# For released consumers, switch to the git source instead:
+#   repo: "https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git"
+#   tag: "v0.1.0"
+name: rfdetr
+path: "."
+capabilities:
+  - class_name: cuvis_ai_rfdetr.node.rfdetr_detector.RFDETRDetector
