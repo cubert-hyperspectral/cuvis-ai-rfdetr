@@ -6,3 +6,6 @@ name: rfdetr
 path: "."
 capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_detector.RFDETRDetector
+  - class_name: cuvis_ai_rfdetr.node.rfdetr_segmenter.RFDETRSegmenter
+  - class_name: cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable
+  - class_name: cuvis_ai_rfdetr.node.rfdetr_loss.RFDETRCriterionLoss

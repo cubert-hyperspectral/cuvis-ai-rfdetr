@@ -106,6 +106,10 @@ class RFDETRDetector(Node):
         variant: str = "medium",
         threshold: float = 0.5,
         resolution: int | None = None,
+        tiling: str = "tiled",
+        tile_rows: int = 405,
+        row_starts: tuple[int, ...] = (0, 291, 582),
+        nms_iou: float = 0.5,
         **kwargs: Any,
     ) -> None:
         """Configure the detector without loading any weights yet.
@@ -125,7 +129,24 @@ class RFDETRDetector(Node):
         resolution : int, optional
             Optional input resolution forwarded to the RF-DETR constructor.
             ``None`` keeps the variant's default (RF-DETR enforces its own
-            divisibility constraints).
+            divisibility constraints). RF-DETR accepts any resolution divisible
+            by the patch size (14) and interpolates positional encodings, so a
+            higher value (e.g. 640 / 728) can be tried for small-object recall.
+        tiling : str
+            ``"tiled"`` (default) splits each frame into overlapping full-width
+            row-strips (``tile_rows`` high) at ``row_starts``, runs the model
+            per tile, offsets boxes back to frame coordinates, and merges them
+            with NMS at ``nms_iou`` — reproducing the tiled evaluation protocol
+            for tall/narrow lane crops. ``"whole"`` runs the model once on the
+            full frame (relying on RF-DETR's internal resize).
+        tile_rows : int
+            Row height of each tile in ``"tiled"`` mode (default 405).
+        row_starts : tuple[int, ...]
+            Top-row offsets of the tiles in ``"tiled"`` mode (default
+            ``(0, 291, 582)`` = three overlapping 405-row tiles over a 987-row
+            lane crop, matching the training/eval protocol).
+        nms_iou : float
+            IoU threshold for merging boxes across tiles (default 0.5).
         """
         variant_key = str(variant).lower()
         if variant_key not in _VARIANT_CLASS_NAMES:
@@ -144,11 +165,31 @@ class RFDETRDetector(Node):
                 raise ValueError(
                     f"RFDETRDetector: resolution must be a positive int, got {resolution}."
                 )
+        tiling = str(tiling).lower()
+        if tiling not in ("tiled", "whole"):
+            raise ValueError(
+                f"RFDETRDetector: tiling must be 'tiled' or 'whole', got {tiling!r}."
+            )
+        tile_rows = int(tile_rows)
+        if tile_rows <= 0:
+            raise ValueError(
+                f"RFDETRDetector: tile_rows must be a positive int, got {tile_rows}."
+            )
+        row_starts = tuple(int(r) for r in row_starts)
+        nms_iou = float(nms_iou)
+        if not 0.0 <= nms_iou <= 1.0:
+            raise ValueError(
+                f"RFDETRDetector: nms_iou must be within [0, 1], got {nms_iou}."
+            )
 
         self.checkpoint_path = checkpoint_path
         self.variant = variant_key
         self.threshold = threshold
         self.resolution = resolution
+        self.tiling = tiling
+        self.tile_rows = tile_rows
+        self.row_starts = row_starts
+        self.nms_iou = nms_iou
 
         name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
@@ -158,6 +199,10 @@ class RFDETRDetector(Node):
             variant=self.variant,
             threshold=self.threshold,
             resolution=self.resolution,
+            tiling=self.tiling,
+            tile_rows=self.tile_rows,
+            row_starts=self.row_starts,
+            nms_iou=self.nms_iou,
             **kwargs,
         )
 
@@ -235,6 +280,44 @@ class RFDETRDetector(Node):
             rows.append((x1, y1, x2, y2, conf, cid))
         return rows
 
+    @staticmethod
+    def _box_iou(a: tuple, b: tuple) -> float:
+        """IoU of two ``[x1, y1, x2, y2]`` boxes."""
+        ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+        ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+        iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+        inter = iw * ih
+        area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0.0 else 0.0
+
+    def _nms(self, rows: list) -> list:
+        """Greedy NMS by descending confidence at ``self.nms_iou`` (matches the eval)."""
+        keep: list = []
+        for b in sorted(rows, key=lambda t: -t[4]):
+            if all(self._box_iou(b[:4], k[:4]) < self.nms_iou for k in keep):
+                keep.append(b)
+        return keep
+
+    def _boxes_for_frame(self, model: Any, frame: Any, height: int) -> list:
+        """Boxes for one HWC uint8 frame: whole-frame, or tiled + NMS-merged.
+
+        ``"tiled"`` reproduces the training/eval protocol: full-width row-strips
+        of ``tile_rows`` at each ``row_starts`` offset, boxes shifted back into
+        frame coordinates by the tile's top row, then merged with NMS.
+        """
+        if self.tiling == "whole":
+            return self._predict_frame(model, frame)
+        rows: list = []
+        for r0 in self.row_starts:
+            r1 = min(r0 + self.tile_rows, height)
+            if r1 <= r0:
+                continue
+            for x1, y1, x2, y2, conf, cid in self._predict_frame(model, frame[r0:r1, :, :]):
+                rows.append((x1, y1 + r0, x2, y2 + r0, conf, cid))
+        return self._nms(rows)
+
     def forward(
         self,
         rgb_image: Tensor,
@@ -261,7 +344,7 @@ class RFDETRDetector(Node):
         for idx in range(batch):
             items: list[dict[str, Any]] = []
             best_confidence = 0.0
-            for x1, y1, x2, y2, conf, cid in self._predict_frame(model, frames[idx]):
+            for x1, y1, x2, y2, conf, cid in self._boxes_for_frame(model, frames[idx], height):
                 items.append(
                     {
                         "xyxy": [x1, y1, x2, y2],

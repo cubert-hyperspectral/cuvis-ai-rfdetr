@@ -47,10 +47,12 @@ dependencies = [
     "rfdetr>=1.8,<2",
     "torch>=2.2",
     "numpy",
+    "scipy>=1.10",
     "supervision>=0.29",
 ]
 
 [project.optional-dependencies]
+train = ["rfdetr[train]>=1.8,<2"]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -81,6 +83,7 @@ python_files = ["test_*.py"]
 pythonpath = ["."]
 markers = [
     "integration: exercises the cuvis-ai-core plugin loader",
+    "slow: GPU / rfdetr-dependent smoke tests (excluded in CI via -m 'not slow')",
 ]
 
 [tool.coverage.run]

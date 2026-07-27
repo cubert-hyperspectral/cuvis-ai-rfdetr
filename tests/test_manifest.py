@@ -75,6 +75,26 @@ def test_invalid_threshold_rejected() -> None:
         RFDETRDetector(threshold=1.5)
 
 
+def test_tiling_hparams() -> None:
+    """Tiling config defaults to the eval protocol and round-trips into hparams."""
+    node = RFDETRDetector()
+    assert node.tiling == "tiled"
+    assert node.tile_rows == 405
+    assert node.row_starts == (0, 291, 582)
+    assert node.nms_iou == 0.5
+    assert node.hparams["tiling"] == "tiled"
+    assert node.hparams["row_starts"] == (0, 291, 582)
+    custom = RFDETRDetector(tiling="whole", tile_rows=448, row_starts=(0, 300), nms_iou=0.4)
+    assert custom.tiling == "whole"
+    assert custom.hparams["tile_rows"] == 448
+
+
+def test_invalid_tiling_rejected() -> None:
+    """Only 'tiled' or 'whole' are accepted."""
+    with pytest.raises(ValueError, match="tiling"):
+        RFDETRDetector(tiling="pyramid")
+
+
 def test_bad_input_shape_rejected_before_model_init() -> None:
     """Shape validation fires before any rfdetr import is attempted."""
     node = RFDETRDetector()
