@@ -199,6 +199,43 @@ class RFDETRTrainable(Node):
         # Registered submodule: parameters/state_dict flow through the pipeline.
         self.model = module.model
         self._input_resolution = int(model_config.resolution)
+
+        # rfdetr's num_channels config is NOT propagated to the DINOv2 patch-embed
+        # (its conv + assert stay at 3). Inflate the pretrained RGB patch-embed
+        # conv to num_channels — tile the 3 input-channel filters and rescale to
+        # preserve activation magnitude — and fix the module's channel assert.
+        if self.num_channels != 3:
+            from torch import nn
+
+            patched = []
+            for _name, mod in self.model.named_modules():
+                proj = getattr(mod, "projection", None)
+                if (
+                    _name.endswith("patch_embeddings")
+                    and isinstance(proj, nn.Conv2d)
+                    and proj.in_channels == 3
+                    and getattr(mod, "num_channels", None) == 3
+                ):
+                    out_c, _, kh, kw = proj.weight.shape
+                    new = nn.Conv2d(
+                        self.num_channels, out_c, (kh, kw),
+                        stride=proj.stride, padding=proj.padding,
+                        bias=proj.bias is not None,
+                    ).to(proj.weight.device)
+                    reps = (self.num_channels + 2) // 3
+                    w = proj.weight.data.repeat(1, reps, 1, 1)[:, : self.num_channels]
+                    new.weight.data.copy_((w * (3.0 / self.num_channels)).to(new.weight.dtype))
+                    if proj.bias is not None:
+                        new.bias.data.copy_(proj.bias.data)
+                    mod.projection = new
+                    mod.num_channels = self.num_channels
+                    patched.append(_name)
+            if not patched:
+                raise RuntimeError(
+                    "RFDETRTrainable: no 3-channel DINOv2 patch-embed found to inflate "
+                    f"to num_channels={self.num_channels}."
+                )
+            self._inflated_patch_embed = patched
         # rfdetr cycles the 3 ImageNet stats to num_channels for non-RGB input.
         base_m = list(getattr(wrapper, "means", [0.485, 0.456, 0.406]))
         base_s = list(getattr(wrapper, "stds", [0.229, 0.224, 0.225]))
