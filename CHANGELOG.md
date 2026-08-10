@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-10
+
 ### Added
 - Added `PercentileComposite`: three-band false-color composite node with per-band full-frame percentile stretch and `*255 + 0.5` quantization — arithmetic-identical to JPEG tile exporters, so downstream uint8 conversion recovers the exact exporter bytes.
 - Added parity hyperparameters to `RFDETRDetector` and `RFDETRSegmenter` for byte-faithful reproduction of file-based evaluation harnesses: `jpeg_roundtrip`/`jpeg_quality` (in-memory JPEG encode/decode of each model input — the compression is part of such harnesses' score definition), `class_filter` (single-foreground-class scoring, applied before NMS/paste), and `score_reduction="top_frac_mean"` + `top_frac` (image score = mean of the top pixel fraction of the score map, integer-floor top-k; default remains `"max_conf"`).
