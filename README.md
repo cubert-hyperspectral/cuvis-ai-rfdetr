@@ -21,7 +21,7 @@ this package. See `NOTICE` for attribution.
 ## Install
 
 ```bash
-pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.2.0"
+pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.3.0"
 ```
 
 Dependencies pull in the RF-DETR **core (inference) tier** only. The `rfdetr`
@@ -50,9 +50,15 @@ Shared hyperparameters:
   threshold is part of the score definition — keep it at the evaluation
   protocol's value.
 - `resolution` (`int | None`) — input resolution forwarded to the RF-DETR
-  constructor. **When loading a fine-tuned checkpoint, set this to the
-  checkpoint's training resolution** — the constructor does not read it from
-  the file, and a mismatch silently changes every score.
+  constructor; `None` keeps the class default.
+- `checkpoint_loader` (`"constructor"` default / `"from_checkpoint"`) — where
+  the model *configuration* comes from when loading a fine-tuned checkpoint.
+  `"from_checkpoint"` delegates to `rfdetr.RFDETR.from_checkpoint`: class and
+  configuration come from the checkpoint, **falling back to class defaults for
+  fields it does not carry — including resolution** (fine-tuned checkpoints do
+  not necessarily record their training resolution). The two loaders can yield
+  materially different scores from the same checkpoint — match the loader your
+  reference results were produced with.
 - `tiling` (`"tiled"` default / `"whole"`), `tile_rows` (405), `row_starts`
   (`(0, 291, 582)`), `nms_iou` (0.5) — `"tiled"` splits each frame into
   full-width row strips, runs the model per strip, offsets results back, and
@@ -117,7 +123,7 @@ five nodes. Released consumers should pin the git source instead:
 ```yaml
 name: rfdetr
 repo: "https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git"
-tag: "v0.2.0"
+tag: "v0.3.0"
 capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_detector.RFDETRDetector
   - class_name: cuvis_ai_rfdetr.node.rfdetr_segmenter.RFDETRSegmenter
@@ -138,7 +144,7 @@ nodes:
     hparams:
       checkpoint_path: runs/ft/checkpoint_best_total.pth
       variant: medium
-      resolution: 624          # = the checkpoint's training resolution
+      checkpoint_loader: from_checkpoint   # reproduce a from_checkpoint-based harness
       threshold: 0.02
       tiling: tiled
       jpeg_roundtrip: true     # reproduce a JPEG-tile evaluation harness

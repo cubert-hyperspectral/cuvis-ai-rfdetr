@@ -113,6 +113,7 @@ class RFDETRSegmenter(Node):
         class_filter: int | None = None,
         score_reduction: str = "max_conf",
         top_frac: float = 0.001,
+        checkpoint_loader: str = "constructor",
         **kwargs: Any,
     ) -> None:
         """Configure the segmenter without loading any weights yet.
@@ -122,10 +123,21 @@ class RFDETRSegmenter(Node):
         ``checkpoint_path`` points at fine-tuned RF-DETR-Seg weights (the
         ``.pth`` written by RF-DETR's own trainer) for weight transfer.
 
-        Reproduction note: when loading a fine-tuned checkpoint, also set
-        ``resolution`` to the checkpoint's training resolution — the class
-        constructor does not read it from the file, and a mismatched
-        resolution silently changes every score.
+        Reproduction note — ``checkpoint_loader`` decides where the model
+        *configuration* comes from, and the same checkpoint can yield
+        materially different scores between the two loaders:
+
+        - ``"constructor"`` (default): build the configured ``variant`` at
+          the given ``resolution`` (or the class default when ``None``) and
+          load the checkpoint's weights into it.
+        - ``"from_checkpoint"``: delegate to ``rfdetr.RFDETR.from_checkpoint``
+          — model class and configuration come from the checkpoint itself,
+          falling back to **class defaults for fields the checkpoint does not
+          carry, including resolution** (a fine-tuned checkpoint does not
+          necessarily record its training resolution). Use this to reproduce
+          harnesses that load checkpoints the same way; ``resolution`` (if
+          set) is forwarded as an explicit override, and ``variant`` must
+          match the class resolved from the checkpoint.
 
         Parity parameters (for byte-faithful reproduction of evaluation
         harnesses built around per-tile JPEG files and top-fraction image
@@ -188,6 +200,12 @@ class RFDETRSegmenter(Node):
         top_frac = float(top_frac)
         if not 0.0 < top_frac <= 1.0:
             raise ValueError(f"RFDETRSegmenter: top_frac must be within (0, 1], got {top_frac}.")
+        checkpoint_loader = str(checkpoint_loader).lower()
+        if checkpoint_loader not in ("constructor", "from_checkpoint"):
+            raise ValueError(
+                f"RFDETRSegmenter: checkpoint_loader must be 'constructor' or "
+                f"'from_checkpoint', got {checkpoint_loader!r}."
+            )
 
         self.checkpoint_path = checkpoint_path
         self.variant = variant_key
@@ -202,6 +220,7 @@ class RFDETRSegmenter(Node):
         self.class_filter = class_filter
         self.score_reduction = score_reduction
         self.top_frac = top_frac
+        self.checkpoint_loader = checkpoint_loader
 
         name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
@@ -220,6 +239,7 @@ class RFDETRSegmenter(Node):
             class_filter=self.class_filter,
             score_reduction=self.score_reduction,
             top_frac=self.top_frac,
+            checkpoint_loader=self.checkpoint_loader,
             **kwargs,
         )
 
@@ -242,6 +262,26 @@ class RFDETRSegmenter(Node):
             ) from exc
 
         class_name = _SEG_VARIANT_CLASS_NAMES[self.variant]
+        if self.checkpoint_path is not None and self.checkpoint_loader == "from_checkpoint":
+            loader = getattr(rfdetr, "RFDETR", None)
+            if loader is None or not hasattr(loader, "from_checkpoint"):
+                raise RuntimeError(
+                    "RFDETRSegmenter: checkpoint_loader='from_checkpoint' requires "
+                    "rfdetr>=1.8 (rfdetr.RFDETR.from_checkpoint not found)."
+                )
+            loader_kwargs: dict[str, Any] = {}
+            if self.resolution is not None:
+                loader_kwargs["resolution"] = int(self.resolution)
+            model = loader.from_checkpoint(str(self.checkpoint_path), **loader_kwargs)
+            loaded = type(model).__name__
+            if loaded != class_name:
+                raise RuntimeError(
+                    f"RFDETRSegmenter: checkpoint resolved to {loaded}, but "
+                    f"variant={self.variant!r} expects {class_name}. Set variant to "
+                    f"match the checkpoint or use checkpoint_loader='constructor'."
+                )
+            return model
+
         model_cls = getattr(rfdetr, class_name, None)
         if model_cls is None:
             raise RuntimeError(

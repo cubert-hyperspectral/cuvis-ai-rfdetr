@@ -111,6 +111,61 @@ def test_segmenter_rejects_bad_args() -> None:
         RFDETRSegmenter(top_frac=0.0)
 
 
+def test_checkpoint_loader_validation_and_round_trip() -> None:
+    from cuvis_ai_rfdetr.node.rfdetr_detector import RFDETRDetector
+
+    assert RFDETRSegmenter().checkpoint_loader == "constructor"  # back-compat default
+    node = RFDETRSegmenter(checkpoint_loader="from_checkpoint")
+    assert node.hparams["checkpoint_loader"] == "from_checkpoint"
+    with pytest.raises(ValueError, match="checkpoint_loader"):
+        RFDETRSegmenter(checkpoint_loader="magic")
+    with pytest.raises(ValueError, match="checkpoint_loader"):
+        RFDETRDetector(checkpoint_loader="auto")
+
+
+@pytest.mark.skipif(not RFDETR_INSTALLED, reason="needs rfdetr to monkeypatch its loader")
+def test_from_checkpoint_variant_mismatch_raises(monkeypatch) -> None:
+    """A checkpoint resolving to a different class than `variant` must fail loudly."""
+    import rfdetr
+
+    class RFDETRSegLarge:  # noqa: N801 - mimics the resolved class name
+        pass
+
+    monkeypatch.setattr(
+        rfdetr.RFDETR, "from_checkpoint", classmethod(lambda cls, p, **kw: RFDETRSegLarge())
+    )
+    node = RFDETRSegmenter(
+        checkpoint_path="w.pth", variant="medium", checkpoint_loader="from_checkpoint"
+    )
+    with pytest.raises(RuntimeError, match="resolved to RFDETRSegLarge"):
+        node._build_model()
+
+
+@pytest.mark.skipif(not RFDETR_INSTALLED, reason="needs rfdetr to monkeypatch its loader")
+def test_from_checkpoint_forwards_resolution_override(monkeypatch) -> None:
+    import rfdetr
+
+    seen: dict = {}
+
+    class RFDETRSegMedium:  # noqa: N801
+        pass
+
+    def fake(cls, path, **kw):
+        seen.update(kw, path=path)
+        return RFDETRSegMedium()
+
+    monkeypatch.setattr(rfdetr.RFDETR, "from_checkpoint", classmethod(fake))
+    node = RFDETRSegmenter(
+        checkpoint_path="w.pth", checkpoint_loader="from_checkpoint", resolution=624
+    )
+    assert type(node._build_model()).__name__ == "RFDETRSegMedium"
+    assert seen == {"path": "w.pth", "resolution": 624}
+    # without resolution set, nothing is forwarded (checkpoint/class defaults rule)
+    seen.clear()
+    RFDETRSegmenter(checkpoint_path="w.pth", checkpoint_loader="from_checkpoint")._build_model()
+    assert seen == {"path": "w.pth"}
+
+
 def test_detector_parity_hparams_and_validation() -> None:
     from cuvis_ai_rfdetr.node.rfdetr_detector import RFDETRDetector
 
