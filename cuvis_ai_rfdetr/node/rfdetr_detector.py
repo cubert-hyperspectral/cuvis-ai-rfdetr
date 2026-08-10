@@ -123,6 +123,7 @@ class RFDETRDetector(Node):
         class_filter: int | None = None,
         score_reduction: str = "max_conf",
         top_frac: float = 0.001,
+        checkpoint_loader: str = "constructor",
         **kwargs: Any,
     ) -> None:
         """Configure the detector without loading any weights yet.
@@ -132,8 +133,8 @@ class RFDETRDetector(Node):
         checkpoint_path : str, optional
             Path to fine-tuned RF-DETR weights (e.g. the
             ``checkpoint_best_total.pth`` written by RF-DETR's own trainer).
-            Passed to the model's ``pretrain_weights``. ``None`` loads the
-            official COCO-pretrained weights for the selected variant.
+            ``None`` loads the official COCO-pretrained weights for the
+            selected variant.
         variant : str
             RF-DETR size variant: ``"nano"``, ``"small"``, ``"medium"``, or
             ``"large"`` (the Apache-2.0 tier).
@@ -145,9 +146,20 @@ class RFDETRDetector(Node):
             divisibility constraints). RF-DETR accepts any resolution divisible
             by the patch size (14) and interpolates positional encodings, so a
             higher value (e.g. 640 / 728) can be tried for small-object recall.
-            When loading a fine-tuned checkpoint, set this to the checkpoint's
-            training resolution — the constructor does not read it from the
-            file, and a mismatch silently changes every score.
+        checkpoint_loader : str
+            Where the model *configuration* comes from when loading a
+            fine-tuned checkpoint — the same checkpoint can yield materially
+            different scores between the two loaders. ``"constructor"``
+            (default): build the configured variant at ``resolution`` (or the
+            class default) and load the checkpoint's weights into it.
+            ``"from_checkpoint"``: delegate to
+            ``rfdetr.RFDETR.from_checkpoint`` — class and configuration come
+            from the checkpoint, falling back to **class defaults for fields
+            the checkpoint does not carry, including resolution** (fine-tuned
+            checkpoints do not necessarily record their training resolution).
+            Use this to reproduce harnesses that load checkpoints the same
+            way; ``resolution`` (if set) is forwarded as an explicit override,
+            and ``variant`` must match the class resolved from the checkpoint.
         tiling : str
             ``"tiled"`` (default) splits each frame into overlapping full-width
             row-strips (``tile_rows`` high) at ``row_starts``, runs the model
@@ -227,6 +239,12 @@ class RFDETRDetector(Node):
         top_frac = float(top_frac)
         if not 0.0 < top_frac <= 1.0:
             raise ValueError(f"RFDETRDetector: top_frac must be within (0, 1], got {top_frac}.")
+        checkpoint_loader = str(checkpoint_loader).lower()
+        if checkpoint_loader not in ("constructor", "from_checkpoint"):
+            raise ValueError(
+                f"RFDETRDetector: checkpoint_loader must be 'constructor' or "
+                f"'from_checkpoint', got {checkpoint_loader!r}."
+            )
 
         self.checkpoint_path = checkpoint_path
         self.variant = variant_key
@@ -241,6 +259,7 @@ class RFDETRDetector(Node):
         self.class_filter = class_filter
         self.score_reduction = score_reduction
         self.top_frac = top_frac
+        self.checkpoint_loader = checkpoint_loader
 
         name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
@@ -259,6 +278,7 @@ class RFDETRDetector(Node):
             class_filter=self.class_filter,
             score_reduction=self.score_reduction,
             top_frac=self.top_frac,
+            checkpoint_loader=self.checkpoint_loader,
             **kwargs,
         )
 
@@ -284,6 +304,26 @@ class RFDETRDetector(Node):
             ) from exc
 
         class_name = _VARIANT_CLASS_NAMES[self.variant]
+        if self.checkpoint_path is not None and self.checkpoint_loader == "from_checkpoint":
+            loader = getattr(rfdetr, "RFDETR", None)
+            if loader is None or not hasattr(loader, "from_checkpoint"):
+                raise RuntimeError(
+                    "RFDETRDetector: checkpoint_loader='from_checkpoint' requires "
+                    "rfdetr>=1.8 (rfdetr.RFDETR.from_checkpoint not found)."
+                )
+            loader_kwargs: dict[str, Any] = {}
+            if self.resolution is not None:
+                loader_kwargs["resolution"] = int(self.resolution)
+            model = loader.from_checkpoint(str(self.checkpoint_path), **loader_kwargs)
+            loaded = type(model).__name__
+            if loaded != class_name:
+                raise RuntimeError(
+                    f"RFDETRDetector: checkpoint resolved to {loaded}, but "
+                    f"variant={self.variant!r} expects {class_name}. Set variant to "
+                    f"match the checkpoint or use checkpoint_loader='constructor'."
+                )
+            return model
+
         model_cls = getattr(rfdetr, class_name, None)
         if model_cls is None:
             raise RuntimeError(

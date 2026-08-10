@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-10
+
+### Added
+- Added `checkpoint_loader` hyperparameter to `RFDETRDetector` and `RFDETRSegmenter` (`"constructor"` default / `"from_checkpoint"`). `"from_checkpoint"` delegates to `rfdetr.RFDETR.from_checkpoint`, taking the model class and configuration from the checkpoint itself and falling back to **class defaults for fields the checkpoint does not carry — including resolution**. This reproduces harnesses that load checkpoints the same way; the two loaders can yield materially different scores from the same checkpoint (verified: a fine-tuned checkpoint without a recorded resolution evaluates at the class default under `from_checkpoint`, not at its training resolution). `variant` is validated against the resolved class; an explicit `resolution` is forwarded as an override.
+
+### Changed
+- Corrected the `resolution` guidance: the previous note ("set resolution to the checkpoint's training resolution") reproduces the *constructor* path only. To reproduce `from_checkpoint`-based harnesses, use `checkpoint_loader="from_checkpoint"` and leave `resolution` unset.
+
 ## [0.2.0] - 2026-08-10
 
 ### Added
