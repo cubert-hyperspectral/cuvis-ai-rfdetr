@@ -96,8 +96,7 @@ class PercentileComposite(Node):
         bands = tuple(float(b) for b in bands_nm)
         if len(bands) != 3:
             raise ValueError(
-                f"PercentileComposite: bands_nm must have exactly 3 entries, "
-                f"got {len(bands)}."
+                f"PercentileComposite: bands_nm must have exactly 3 entries, got {len(bands)}."
             )
         p_low = float(p_low)
         p_high = float(p_high)
@@ -131,8 +130,7 @@ class PercentileComposite(Node):
         """Compose one stretched false-color image per frame."""
         if cube.dim() != 4:
             raise ValueError(
-                f"PercentileComposite expects cube of shape [B, H, W, C], "
-                f"got {tuple(cube.shape)}."
+                f"PercentileComposite expects cube of shape [B, H, W, C], got {tuple(cube.shape)}."
             )
         batch = cube.shape[0]
         device = cube.device

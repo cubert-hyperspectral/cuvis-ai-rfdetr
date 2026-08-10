@@ -32,9 +32,7 @@ class RFDETRCriterionLoss(Node):
     """
 
     _category = NodeCategory.LOSS
-    _tags = frozenset(
-        {NodeTag.DETECTION, NodeTag.TRAINING, NodeTag.DIFFERENTIABLE, NodeTag.TORCH}
-    )
+    _tags = frozenset({NodeTag.DETECTION, NodeTag.TRAINING, NodeTag.DIFFERENTIABLE, NodeTag.TORCH})
 
     INPUT_SPECS = {
         "outputs": PortSpec(

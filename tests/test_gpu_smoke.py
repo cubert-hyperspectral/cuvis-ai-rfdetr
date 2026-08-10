@@ -78,7 +78,9 @@ def test_trainable_segmentation_variant_loss_runs() -> None:
     from cuvis_ai_rfdetr.node.rfdetr_trainable import RFDETRTrainable
 
     node = RFDETRTrainable(dataset_dir=DATASET_DIR, variant="medium", segmentation=True).to("cuda")
-    loss_node = RFDETRCriterionLoss(dataset_dir=DATASET_DIR, variant="medium", segmentation=True).to("cuda")
+    loss_node = RFDETRCriterionLoss(
+        dataset_dir=DATASET_DIR, variant="medium", segmentation=True
+    ).to("cuda")
     node.train()
     loss_node.train()
     rgb = torch.rand(1, 128, 96, 3, device="cuda")

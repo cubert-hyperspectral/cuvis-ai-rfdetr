@@ -154,9 +154,7 @@ class RFDETRSegmenter(Node):
             )
         threshold = float(threshold)
         if not 0.0 <= threshold <= 1.0:
-            raise ValueError(
-                f"RFDETRSegmenter: threshold must be within [0, 1], got {threshold}."
-            )
+            raise ValueError(f"RFDETRSegmenter: threshold must be within [0, 1], got {threshold}.")
         if resolution is not None:
             resolution = int(resolution)
             if resolution <= 0:
@@ -165,20 +163,14 @@ class RFDETRSegmenter(Node):
                 )
         tiling = str(tiling).lower()
         if tiling not in ("tiled", "whole"):
-            raise ValueError(
-                f"RFDETRSegmenter: tiling must be 'tiled' or 'whole', got {tiling!r}."
-            )
+            raise ValueError(f"RFDETRSegmenter: tiling must be 'tiled' or 'whole', got {tiling!r}.")
         tile_rows = int(tile_rows)
         if tile_rows <= 0:
-            raise ValueError(
-                f"RFDETRSegmenter: tile_rows must be a positive int, got {tile_rows}."
-            )
+            raise ValueError(f"RFDETRSegmenter: tile_rows must be a positive int, got {tile_rows}.")
         row_starts = tuple(int(r) for r in row_starts)
         nms_iou = float(nms_iou)
         if not 0.0 <= nms_iou <= 1.0:
-            raise ValueError(
-                f"RFDETRSegmenter: nms_iou must be within [0, 1], got {nms_iou}."
-            )
+            raise ValueError(f"RFDETRSegmenter: nms_iou must be within [0, 1], got {nms_iou}.")
         jpeg_roundtrip = bool(jpeg_roundtrip)
         jpeg_quality = int(jpeg_quality)
         if not 1 <= jpeg_quality <= 100:
@@ -195,9 +187,7 @@ class RFDETRSegmenter(Node):
             )
         top_frac = float(top_frac)
         if not 0.0 < top_frac <= 1.0:
-            raise ValueError(
-                f"RFDETRSegmenter: top_frac must be within (0, 1], got {top_frac}."
-            )
+            raise ValueError(f"RFDETRSegmenter: top_frac must be within (0, 1], got {top_frac}.")
 
         self.checkpoint_path = checkpoint_path
         self.variant = variant_key

@@ -164,6 +164,4 @@ def test_percentile_composite_validates_hparams() -> None:
 def test_percentile_composite_rejects_bad_cube() -> None:
     node = PercentileComposite()
     with pytest.raises(ValueError, match="B, H, W, C"):
-        node.forward(
-            cube=torch.zeros(4, 4, 3), wavelengths=torch.tensor([[470, 500, 574]])
-        )
+        node.forward(cube=torch.zeros(4, 4, 3), wavelengths=torch.tensor([[470, 500, 574]]))

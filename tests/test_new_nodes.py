@@ -114,9 +114,7 @@ def test_segmenter_rejects_bad_args() -> None:
 def test_detector_parity_hparams_and_validation() -> None:
     from cuvis_ai_rfdetr.node.rfdetr_detector import RFDETRDetector
 
-    node = RFDETRDetector(
-        jpeg_roundtrip=True, class_filter=1, score_reduction="top_frac_mean"
-    )
+    node = RFDETRDetector(jpeg_roundtrip=True, class_filter=1, score_reduction="top_frac_mean")
     assert node.hparams["jpeg_roundtrip"] is True
     assert node.hparams["class_filter"] == 1
     assert node.hparams["score_reduction"] == "top_frac_mean"
@@ -165,9 +163,7 @@ def test_manifest_lists_all_nodes() -> None:
 
     import yaml
 
-    manifest = yaml.safe_load(
-        (pathlib.Path(__file__).parent.parent / "plugins.yaml").read_text()
-    )
+    manifest = yaml.safe_load((pathlib.Path(__file__).parent.parent / "plugins.yaml").read_text())
     names = {c["class_name"].rsplit(".", 1)[1] for c in manifest["capabilities"]}
     assert names == {
         "RFDETRDetector",
