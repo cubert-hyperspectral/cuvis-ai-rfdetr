@@ -46,6 +46,69 @@ def to_uint8_frames(rgb_image: Tensor) -> np.ndarray:
     return x.clamp(0.0, 255.0).round().to(torch.uint8).contiguous().numpy()
 
 
+def jpeg_roundtrip(frame_u8: np.ndarray, quality: int = 95) -> np.ndarray:
+    """Encode/decode one uint8 HWC RGB frame through an in-memory JPEG.
+
+    Byte-equivalent to saving the frame as a ``.jpg`` with Pillow and reading
+    it back (same encoder, same default 4:2:0 chroma subsampling), without
+    touching the filesystem. Evaluation harnesses that persist model inputs as
+    JPEG tiles make the (lossy) compression part of the score definition;
+    routing inference through this function reproduces their scores exactly.
+
+    Determinism note: the output depends on the Pillow version — pin Pillow
+    when byte-exact reproduction across environments is required.
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    if frame_u8.dtype != np.uint8 or frame_u8.ndim != 3 or frame_u8.shape[-1] != 3:
+        raise ValueError(
+            f"jpeg_roundtrip expects a uint8 HWC RGB frame, "
+            f"got dtype={frame_u8.dtype}, shape={frame_u8.shape}."
+        )
+    buf = BytesIO()
+    Image.fromarray(frame_u8).save(buf, format="JPEG", quality=int(quality))
+    buf.seek(0)
+    with Image.open(buf) as im:
+        return np.asarray(im.convert("RGB"))
+
+
+def top_frac_mean(score_map, top_frac: float = 0.001) -> float:
+    """Image-level score = mean of the top ``top_frac`` fraction of pixels.
+
+    Exact arithmetic of the tiled evaluation protocol: flatten, ascending
+    sort, ``k = clamp(int((1 - top_frac) * N), 0, N - 1)``, mean of
+    ``flat[k:]``. With the integer floor this selects e.g. exactly the top
+    400 pixels of a 987x405 map at ``top_frac=0.001``. Robust to sparse maps:
+    zeros participate, so a single confident blob scores far below its peak
+    confidence unless it covers the whole top fraction.
+    """
+    a = (
+        score_map.detach().to("cpu").numpy()
+        if isinstance(score_map, Tensor)
+        else np.asarray(score_map)
+    )
+    flat = np.sort(a.astype(np.float32, copy=False).ravel())
+    if flat.size == 0:
+        return 0.0
+    k = min(max(int((1.0 - float(top_frac)) * flat.size), 0), flat.size - 1)
+    return float(flat[k:].mean())
+
+
+def resolve_band_indices(wavelengths: np.ndarray, bands_nm) -> list[int]:
+    """Nearest-channel index for each requested wavelength (int64 distance).
+
+    Mirrors the band-resolution rule of composite exporters:
+    ``argmin(|wavelengths - nm|)`` per requested band, on integer-cast
+    wavelengths.
+    """
+    wl = np.asarray(wavelengths).astype(np.int64).ravel()
+    if wl.size == 0:
+        raise ValueError("resolve_band_indices: empty wavelengths array.")
+    return [int(np.argmin(np.abs(wl - float(nm)))) for nm in bands_nm]
+
+
 def targets_from_mask(
     mask: Tensor,
     with_masks: bool = False,

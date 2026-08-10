@@ -146,9 +146,7 @@ class RFDETRTrainable(Node):
                 )
         num_channels = int(num_channels)
         if num_channels < 1:
-            raise ValueError(
-                f"RFDETRTrainable: num_channels must be >= 1, got {num_channels}."
-            )
+            raise ValueError(f"RFDETRTrainable: num_channels must be >= 1, got {num_channels}.")
 
         self.dataset_dir = str(dataset_dir)
         self.checkpoint_path = checkpoint_path
@@ -218,8 +216,11 @@ class RFDETRTrainable(Node):
                 ):
                     out_c, _, kh, kw = proj.weight.shape
                     new = nn.Conv2d(
-                        self.num_channels, out_c, (kh, kw),
-                        stride=proj.stride, padding=proj.padding,
+                        self.num_channels,
+                        out_c,
+                        (kh, kw),
+                        stride=proj.stride,
+                        padding=proj.padding,
                         bias=proj.bias is not None,
                     ).to(proj.weight.device)
                     reps = (self.num_channels + 2) // 3
