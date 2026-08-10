@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cuvis-ai-rfdetr"
-version = "0.1.0"
+version = "0.2.0"
 description = "RF-DETR (Roboflow, Apache-2.0 tier) object detection as a cuvis.ai plugin node."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [
@@ -49,6 +49,9 @@ dependencies = [
     "numpy",
     "scipy>=1.10",
     "supervision>=0.29",
+    # JPEG round-trip helper (functional.jpeg_roundtrip); pin the exact Pillow
+    # version in your lockfile when byte-exact JPEG reproduction is required.
+    "pillow>=10",
 ]
 
 [project.optional-dependencies]

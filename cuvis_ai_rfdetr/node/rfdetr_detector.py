@@ -12,6 +12,13 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from torch import Tensor
 
+from cuvis_ai_rfdetr.functional import (
+    jpeg_roundtrip as _jpeg_roundtrip,
+)
+from cuvis_ai_rfdetr.functional import (
+    top_frac_mean,
+)
+
 #: Maps the ``variant`` hparam to the model class exported by :mod:`rfdetr`.
 #: Only the Apache-2.0 model tier is exposed; the XL / 2XL checkpoints ship
 #: under the non-open Roboflow Platform Model License and are deliberately
@@ -95,8 +102,9 @@ class RFDETRDetector(Node):
         "anomaly_score": PortSpec(
             dtype=torch.float32,
             shape=(-1,),
-            description="Image-level score [B]: max box confidence "
-            "(0.0 when no detections).",
+            description="Image-level score [B]: max box confidence (default), "
+            "or the mean of the top-fraction pixels of the rasterized map "
+            "when score_reduction='top_frac_mean' (0.0 when empty).",
         ),
     }
 
@@ -110,6 +118,11 @@ class RFDETRDetector(Node):
         tile_rows: int = 405,
         row_starts: tuple[int, ...] = (0, 291, 582),
         nms_iou: float = 0.5,
+        jpeg_roundtrip: bool = False,
+        jpeg_quality: int = 95,
+        class_filter: int | None = None,
+        score_reduction: str = "max_conf",
+        top_frac: float = 0.001,
         **kwargs: Any,
     ) -> None:
         """Configure the detector without loading any weights yet.
@@ -132,6 +145,9 @@ class RFDETRDetector(Node):
             divisibility constraints). RF-DETR accepts any resolution divisible
             by the patch size (14) and interpolates positional encodings, so a
             higher value (e.g. 640 / 728) can be tried for small-object recall.
+            When loading a fine-tuned checkpoint, set this to the checkpoint's
+            training resolution — the constructor does not read it from the
+            file, and a mismatch silently changes every score.
         tiling : str
             ``"tiled"`` (default) splits each frame into overlapping full-width
             row-strips (``tile_rows`` high) at ``row_starts``, runs the model
@@ -147,6 +163,27 @@ class RFDETRDetector(Node):
             lane crop, matching the training/eval protocol).
         nms_iou : float
             IoU threshold for merging boxes across tiles (default 0.5).
+        jpeg_roundtrip : bool
+            Route each model input (every tile in ``"tiled"`` mode, the frame
+            in ``"whole"`` mode) through an in-memory JPEG encode/decode at
+            ``jpeg_quality`` before prediction. Lossy on purpose: evaluation
+            harnesses that persist model inputs as ``.jpg`` files make the
+            compression part of the score definition, and this reproduces
+            their scores exactly.
+        jpeg_quality : int
+            JPEG quality for ``jpeg_roundtrip`` (default 95, Pillow defaults
+            otherwise — pin Pillow for byte-exact reproduction).
+        class_filter : int, optional
+            Keep only detections with this ``class_id`` (dropped before NMS,
+            rasterization, and scoring), matching harnesses that score a
+            single foreground class.
+        score_reduction : str
+            ``"max_conf"`` (default): ``anomaly_score`` = max box confidence.
+            ``"top_frac_mean"``: mean of the top ``top_frac`` fraction of the
+            rasterized score map (integer-floor top-k), comparable to dense
+            models scored the same way.
+        top_frac : float
+            Fraction for ``"top_frac_mean"`` (default 0.001).
         """
         variant_key = str(variant).lower()
         if variant_key not in _VARIANT_CLASS_NAMES:
@@ -181,6 +218,25 @@ class RFDETRDetector(Node):
             raise ValueError(
                 f"RFDETRDetector: nms_iou must be within [0, 1], got {nms_iou}."
             )
+        jpeg_roundtrip = bool(jpeg_roundtrip)
+        jpeg_quality = int(jpeg_quality)
+        if not 1 <= jpeg_quality <= 100:
+            raise ValueError(
+                f"RFDETRDetector: jpeg_quality must be within [1, 100], got {jpeg_quality}."
+            )
+        if class_filter is not None:
+            class_filter = int(class_filter)
+        score_reduction = str(score_reduction).lower()
+        if score_reduction not in ("max_conf", "top_frac_mean"):
+            raise ValueError(
+                f"RFDETRDetector: score_reduction must be 'max_conf' or "
+                f"'top_frac_mean', got {score_reduction!r}."
+            )
+        top_frac = float(top_frac)
+        if not 0.0 < top_frac <= 1.0:
+            raise ValueError(
+                f"RFDETRDetector: top_frac must be within (0, 1], got {top_frac}."
+            )
 
         self.checkpoint_path = checkpoint_path
         self.variant = variant_key
@@ -190,6 +246,11 @@ class RFDETRDetector(Node):
         self.tile_rows = tile_rows
         self.row_starts = row_starts
         self.nms_iou = nms_iou
+        self.jpeg_roundtrip = jpeg_roundtrip
+        self.jpeg_quality = jpeg_quality
+        self.class_filter = class_filter
+        self.score_reduction = score_reduction
+        self.top_frac = top_frac
 
         name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
@@ -203,6 +264,11 @@ class RFDETRDetector(Node):
             tile_rows=self.tile_rows,
             row_starts=self.row_starts,
             nms_iou=self.nms_iou,
+            jpeg_roundtrip=self.jpeg_roundtrip,
+            jpeg_quality=self.jpeg_quality,
+            class_filter=self.class_filter,
+            score_reduction=self.score_reduction,
+            top_frac=self.top_frac,
             **kwargs,
         )
 
@@ -305,16 +371,29 @@ class RFDETRDetector(Node):
 
         ``"tiled"`` reproduces the training/eval protocol: full-width row-strips
         of ``tile_rows`` at each ``row_starts`` offset, boxes shifted back into
-        frame coordinates by the tile's top row, then merged with NMS.
+        frame coordinates by the tile's top row, then merged with NMS. The
+        ``class_filter`` (if set) drops foreign-class detections before NMS;
+        ``jpeg_roundtrip`` compresses each model input first.
         """
         if self.tiling == "whole":
-            return self._predict_frame(model, frame)
-        rows: list = []
+            model_input = (
+                _jpeg_roundtrip(frame, self.jpeg_quality) if self.jpeg_roundtrip else frame
+            )
+            rows = self._predict_frame(model, model_input)
+            if self.class_filter is not None:
+                rows = [r for r in rows if r[5] == self.class_filter]
+            return rows
+        rows = []
         for r0 in self.row_starts:
             r1 = min(r0 + self.tile_rows, height)
             if r1 <= r0:
                 continue
-            for x1, y1, x2, y2, conf, cid in self._predict_frame(model, frame[r0:r1, :, :]):
+            tile = frame[r0:r1, :, :]
+            if self.jpeg_roundtrip:
+                tile = _jpeg_roundtrip(tile, self.jpeg_quality)
+            for x1, y1, x2, y2, conf, cid in self._predict_frame(model, tile):
+                if self.class_filter is not None and cid != self.class_filter:
+                    continue
                 rows.append((x1, y1 + r0, x2, y2 + r0, conf, cid))
         return self._nms(rows)
 
@@ -361,7 +440,10 @@ class RFDETRDetector(Node):
                     scores[idx, row0:row1, col0:col1, 0].clamp_(min=conf)
                 best_confidence = max(best_confidence, conf)
             detections.append(items)
-            anomaly_score[idx] = best_confidence
+            if self.score_reduction == "top_frac_mean":
+                anomaly_score[idx] = top_frac_mean(scores[idx, :, :, 0], self.top_frac)
+            else:
+                anomaly_score[idx] = best_confidence
 
         return {
             "scores": scores.to(device),

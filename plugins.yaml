@@ -9,3 +9,4 @@ capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_segmenter.RFDETRSegmenter
   - class_name: cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable
   - class_name: cuvis_ai_rfdetr.node.rfdetr_loss.RFDETRCriterionLoss
+  - class_name: cuvis_ai_rfdetr.node.percentile_composite.PercentileComposite

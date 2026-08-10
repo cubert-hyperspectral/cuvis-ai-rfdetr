@@ -74,6 +74,28 @@ def test_segmenter_hparams_round_trip() -> None:
     assert node.hparams["tiling"] == "whole"
 
 
+def test_segmenter_parity_hparams_defaults_and_round_trip() -> None:
+    node = RFDETRSegmenter()
+    assert node.jpeg_roundtrip is False
+    assert node.jpeg_quality == 95
+    assert node.class_filter is None
+    assert node.score_reduction == "max_conf"
+    assert node.top_frac == 0.001
+
+    node = RFDETRSegmenter(
+        jpeg_roundtrip=True,
+        jpeg_quality=90,
+        class_filter=1,
+        score_reduction="top_frac_mean",
+        top_frac=0.002,
+    )
+    assert node.hparams["jpeg_roundtrip"] is True
+    assert node.hparams["jpeg_quality"] == 90
+    assert node.hparams["class_filter"] == 1
+    assert node.hparams["score_reduction"] == "top_frac_mean"
+    assert node.hparams["top_frac"] == 0.002
+
+
 def test_segmenter_rejects_bad_args() -> None:
     with pytest.raises(ValueError, match="variant"):
         RFDETRSegmenter(variant="mega")
@@ -81,6 +103,30 @@ def test_segmenter_rejects_bad_args() -> None:
         RFDETRSegmenter(threshold=2.0)
     with pytest.raises(ValueError, match="tiling"):
         RFDETRSegmenter(tiling="mosaic")
+    with pytest.raises(ValueError, match="jpeg_quality"):
+        RFDETRSegmenter(jpeg_quality=0)
+    with pytest.raises(ValueError, match="score_reduction"):
+        RFDETRSegmenter(score_reduction="median")
+    with pytest.raises(ValueError, match="top_frac"):
+        RFDETRSegmenter(top_frac=0.0)
+
+
+def test_detector_parity_hparams_and_validation() -> None:
+    from cuvis_ai_rfdetr.node.rfdetr_detector import RFDETRDetector
+
+    node = RFDETRDetector(
+        jpeg_roundtrip=True, class_filter=1, score_reduction="top_frac_mean"
+    )
+    assert node.hparams["jpeg_roundtrip"] is True
+    assert node.hparams["class_filter"] == 1
+    assert node.hparams["score_reduction"] == "top_frac_mean"
+    assert node.hparams["top_frac"] == 0.001
+    with pytest.raises(ValueError, match="jpeg_quality"):
+        RFDETRDetector(jpeg_quality=101)
+    with pytest.raises(ValueError, match="score_reduction"):
+        RFDETRDetector(score_reduction="p99")
+    with pytest.raises(ValueError, match="top_frac"):
+        RFDETRDetector(top_frac=1.5)
 
 
 def test_segmenter_specs() -> None:
@@ -128,4 +174,5 @@ def test_manifest_lists_all_nodes() -> None:
         "RFDETRSegmenter",
         "RFDETRTrainable",
         "RFDETRCriterionLoss",
+        "PercentileComposite",
     }

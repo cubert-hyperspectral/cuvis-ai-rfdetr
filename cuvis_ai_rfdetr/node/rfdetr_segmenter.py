@@ -12,7 +12,14 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from torch import Tensor
 
-from cuvis_ai_rfdetr.functional import nms_rows, to_uint8_frames
+from cuvis_ai_rfdetr.functional import (
+    jpeg_roundtrip as _jpeg_roundtrip,
+)
+from cuvis_ai_rfdetr.functional import (
+    nms_rows,
+    to_uint8_frames,
+    top_frac_mean,
+)
 
 #: Maps the ``variant`` hparam to the segmentation model class exported by
 #: :mod:`rfdetr`. The whole segmentation tier ships under Apache-2.0 (unlike
@@ -86,7 +93,8 @@ class RFDETRSegmenter(Node):
             dtype=torch.float32,
             shape=(-1,),
             description="Image-level score [B]: max instance confidence "
-            "(0.0 when no detections).",
+            "(default), or the mean of the top-fraction pixels of the score "
+            "map when score_reduction='top_frac_mean' (0.0 when empty).",
         ),
     }
 
@@ -100,6 +108,11 @@ class RFDETRSegmenter(Node):
         tile_rows: int = 405,
         row_starts: tuple[int, ...] = (0, 291, 582),
         nms_iou: float = 0.5,
+        jpeg_roundtrip: bool = False,
+        jpeg_quality: int = 95,
+        class_filter: int | None = None,
+        score_reduction: str = "max_conf",
+        top_frac: float = 0.001,
         **kwargs: Any,
     ) -> None:
         """Configure the segmenter without loading any weights yet.
@@ -108,6 +121,30 @@ class RFDETRSegmenter(Node):
         segmentation tier size (``nano`` … ``2xlarge``, all Apache-2.0), and
         ``checkpoint_path`` points at fine-tuned RF-DETR-Seg weights (the
         ``.pth`` written by RF-DETR's own trainer) for weight transfer.
+
+        Reproduction note: when loading a fine-tuned checkpoint, also set
+        ``resolution`` to the checkpoint's training resolution — the class
+        constructor does not read it from the file, and a mismatched
+        resolution silently changes every score.
+
+        Parity parameters (for byte-faithful reproduction of evaluation
+        harnesses built around per-tile JPEG files and top-fraction image
+        scores):
+
+        - ``jpeg_roundtrip`` / ``jpeg_quality``: route each model input
+          (every tile in ``"tiled"`` mode, the frame in ``"whole"`` mode)
+          through an in-memory JPEG encode/decode before prediction. Lossy
+          on purpose — harnesses that persist tiles as ``.jpg`` make the
+          compression part of the score definition.
+        - ``class_filter``: keep only instances of this ``class_id``
+          (drop the rest before pasting/merging), matching harnesses that
+          score a single foreground class.
+        - ``score_reduction``: ``"max_conf"`` (default) keeps
+          ``anomaly_score`` = max instance confidence; ``"top_frac_mean"``
+          computes it as the mean of the top ``top_frac`` fraction of the
+          pasted score map (integer-floor top-k — e.g. exactly 400 px of a
+          987x405 map at 0.001), directly comparable to dense segmentation
+          models scored the same way.
         """
         variant_key = str(variant).lower()
         if variant_key not in _SEG_VARIANT_CLASS_NAMES:
@@ -142,6 +179,25 @@ class RFDETRSegmenter(Node):
             raise ValueError(
                 f"RFDETRSegmenter: nms_iou must be within [0, 1], got {nms_iou}."
             )
+        jpeg_roundtrip = bool(jpeg_roundtrip)
+        jpeg_quality = int(jpeg_quality)
+        if not 1 <= jpeg_quality <= 100:
+            raise ValueError(
+                f"RFDETRSegmenter: jpeg_quality must be within [1, 100], got {jpeg_quality}."
+            )
+        if class_filter is not None:
+            class_filter = int(class_filter)
+        score_reduction = str(score_reduction).lower()
+        if score_reduction not in ("max_conf", "top_frac_mean"):
+            raise ValueError(
+                f"RFDETRSegmenter: score_reduction must be 'max_conf' or "
+                f"'top_frac_mean', got {score_reduction!r}."
+            )
+        top_frac = float(top_frac)
+        if not 0.0 < top_frac <= 1.0:
+            raise ValueError(
+                f"RFDETRSegmenter: top_frac must be within (0, 1], got {top_frac}."
+            )
 
         self.checkpoint_path = checkpoint_path
         self.variant = variant_key
@@ -151,6 +207,11 @@ class RFDETRSegmenter(Node):
         self.tile_rows = tile_rows
         self.row_starts = row_starts
         self.nms_iou = nms_iou
+        self.jpeg_roundtrip = jpeg_roundtrip
+        self.jpeg_quality = jpeg_quality
+        self.class_filter = class_filter
+        self.score_reduction = score_reduction
+        self.top_frac = top_frac
 
         name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
@@ -164,6 +225,11 @@ class RFDETRSegmenter(Node):
             tile_rows=self.tile_rows,
             row_starts=self.row_starts,
             nms_iou=self.nms_iou,
+            jpeg_roundtrip=self.jpeg_roundtrip,
+            jpeg_quality=self.jpeg_quality,
+            class_filter=self.class_filter,
+            score_reduction=self.score_reduction,
+            top_frac=self.top_frac,
             **kwargs,
         )
 
@@ -247,7 +313,12 @@ class RFDETRSegmenter(Node):
             frame = frames[idx]
             rows: list[tuple] = []
             if self.tiling == "whole":
-                for x1, y1, x2, y2, conf, cid, m in self._predict_frame(model, frame):
+                model_input = (
+                    _jpeg_roundtrip(frame, self.jpeg_quality) if self.jpeg_roundtrip else frame
+                )
+                for x1, y1, x2, y2, conf, cid, m in self._predict_frame(model, model_input):
+                    if self.class_filter is not None and cid != self.class_filter:
+                        continue
                     rows.append((x1, y1, x2, y2, conf, cid))
                     self._paste(scores[idx, :, :, 0], m, conf, 0, x1, y1, x2, y2)
             else:
@@ -255,9 +326,12 @@ class RFDETRSegmenter(Node):
                     r1 = min(r0 + self.tile_rows, height)
                     if r1 <= r0:
                         continue
-                    for x1, y1, x2, y2, conf, cid, m in self._predict_frame(
-                        model, frame[r0:r1, :, :]
-                    ):
+                    tile = frame[r0:r1, :, :]
+                    if self.jpeg_roundtrip:
+                        tile = _jpeg_roundtrip(tile, self.jpeg_quality)
+                    for x1, y1, x2, y2, conf, cid, m in self._predict_frame(model, tile):
+                        if self.class_filter is not None and cid != self.class_filter:
+                            continue
                         rows.append((x1, y1 + r0, x2, y2 + r0, conf, cid))
                         self._paste(scores[idx, :, :, 0], m, conf, r0, x1, y1, x2, y2)
                 rows = nms_rows(rows, self.nms_iou)
@@ -267,7 +341,10 @@ class RFDETRSegmenter(Node):
                 for r in rows
             ]
             detections.append(items)
-            anomaly_score[idx] = max((r[4] for r in rows), default=0.0)
+            if self.score_reduction == "top_frac_mean":
+                anomaly_score[idx] = top_frac_mean(scores[idx, :, :, 0], self.top_frac)
+            else:
+                anomaly_score[idx] = max((r[4] for r in rows), default=0.0)
 
         return {
             "scores": scores.to(device),
