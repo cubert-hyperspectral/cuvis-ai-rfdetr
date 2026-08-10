@@ -60,6 +60,11 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "ruff>=0.1.0",
+    "mypy",
+    "bandit",
+    "detect-secrets",
+    "pip-audit",
+    "twine>=6.2.0",
 ]
 
 [project.urls]
@@ -88,6 +93,18 @@ markers = [
     "integration: exercises the cuvis-ai-core plugin loader",
     "slow: GPU / rfdetr-dependent smoke tests (excluded in CI via -m 'not slow')",
 ]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+exclude = ["tests", "examples", "build", "dist"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "build", "dist"]
+skips = ["B101"]
 
 [tool.coverage.run]
 source = ["cuvis_ai_rfdetr"]
