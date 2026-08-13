@@ -131,6 +131,10 @@ class EmaCallback(pl.Callback):
     save_path : str or None
         When set, the EMA weights are written there at ``fit`` end (same payload
         as :meth:`save`).
+    ema_cls : type or None
+        EMA implementation (``ModelEma``-compatible: ``module``/``updates``
+        attributes, ``update(model)``). Defaults to rfdetr's native ``ModelEma``
+        (lazy import). Injection point for tests and alternative schedules.
     """
 
     def __init__(
@@ -140,6 +144,7 @@ class EmaCallback(pl.Callback):
         tau: float = 100.0,
         update_interval: int = 1,
         save_path: str | None = None,
+        ema_cls: type | None = None,
     ) -> None:
         super().__init__()
         if not 0.0 < float(decay) <= 1.0:
@@ -153,7 +158,8 @@ class EmaCallback(pl.Callback):
         self.tau = float(tau)
         self.update_interval = int(update_interval)
         self.save_path = str(save_path) if save_path is not None else None
-        self.ema = None  # rfdetr ModelEma, built on fit start
+        self.ema_cls = ema_cls
+        self.ema = None  # EMA instance, built on fit start
         self._node = None
         self._batches_seen = 0
         self._pending_state: dict[str, Any] | None = None  # restored ckpt state
@@ -179,15 +185,18 @@ class EmaCallback(pl.Callback):
 
     # ------------------------------------------------------------- lifecycle
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
-        try:  # lazy: importing rfdetr.training pulls the full train stack
-            from rfdetr.training.model_ema import ModelEma
-        except ImportError as exc:  # pragma: no cover - environment-dependent
-            raise ImportError(
-                "EmaCallback requires the rfdetr train stack: pip install 'rfdetr[train]>=1.8,<2'"
-            ) from exc
+        ema_cls = self.ema_cls
+        if ema_cls is None:
+            try:  # lazy: importing rfdetr.training pulls the full train stack
+                from rfdetr.training.model_ema import ModelEma as ema_cls
+            except ImportError as exc:  # pragma: no cover - environment-dependent
+                raise ImportError(
+                    "EmaCallback requires the rfdetr train stack: "
+                    "pip install 'rfdetr[train]>=1.8,<2'"
+                ) from exc
 
         self._node = self._resolve_node(pl_module)
-        self.ema = ModelEma(self._node.model, decay=self.decay, tau=self.tau)
+        self.ema = ema_cls(self._node.model, decay=self.decay, tau=self.tau)
         if self._pending_state is not None:  # resume: restore averaged weights
             self.ema.module.load_state_dict(self._pending_state["ema_state"])
             self.ema.updates = int(self._pending_state["updates"])

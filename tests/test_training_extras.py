@@ -45,6 +45,28 @@ def _fake_pl(node: _Node):
     return trainer, pl_module
 
 
+class _StubEma(torch.nn.Module):
+    """ModelEma-compatible stub (constant decay) so callback logic tests run in CI
+    without the rfdetr train stack; the native decay schedule is asserted separately
+    under the train-stack marker."""
+
+    def __init__(self, model, decay=0.999, tau=0.0, device=None) -> None:
+        super().__init__()
+        from copy import deepcopy
+
+        self.module = deepcopy(model)
+        self.module.eval()
+        self.decay, self.tau, self.updates = float(decay), float(tau), 1
+
+    def update(self, model) -> None:
+        with torch.no_grad():
+            for e, m in zip(
+                self.module.state_dict().values(), model.state_dict().values(), strict=True
+            ):
+                e.copy_(self.decay * e + (1.0 - self.decay) * m)
+        self.updates += 1
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -91,11 +113,10 @@ def test_ema_matches_native_schedule() -> None:
     assert torch.allclose(cb.ema_module.weight, expected, atol=1e-7)
 
 
-@needs_train_stack
 def test_update_interval_gates_updates() -> None:
     node = _Node()
     trainer, pl_module = _fake_pl(node)
-    cb = EmaCallback(update_interval=3, decay=0.5, tau=0.0)
+    cb = EmaCallback(update_interval=3, decay=0.5, tau=0.0, ema_cls=_StubEma)
     cb.on_fit_start(trainer, pl_module)
     with torch.no_grad():
         node.model.weight += 1.0
@@ -107,11 +128,10 @@ def test_update_interval_gates_updates() -> None:
     assert not torch.equal(cb.ema_module.weight, before)  # third batch updates
 
 
-@needs_train_stack
 def test_state_roundtrip_restores_average(tmp_path) -> None:
     node = _Node()
     trainer, pl_module = _fake_pl(node)
-    cb = EmaCallback(decay=0.9, tau=0.0, save_path=str(tmp_path / "ema.pth"))
+    cb = EmaCallback(decay=0.9, tau=0.0, save_path=str(tmp_path / "ema.pth"), ema_cls=_StubEma)
     cb.on_fit_start(trainer, pl_module)
     with torch.no_grad():
         node.model.weight += 1.0
@@ -121,7 +141,7 @@ def test_state_roundtrip_restores_average(tmp_path) -> None:
     # fresh callback + fresh (different) model: resume must restore the average
     node2 = _Node()
     trainer2, pl_module2 = _fake_pl(node2)
-    cb2 = EmaCallback(decay=0.9, tau=0.0)
+    cb2 = EmaCallback(decay=0.9, tau=0.0, ema_cls=_StubEma)
     cb2.load_state_dict(state)
     cb2.on_fit_start(trainer2, pl_module2)
     assert torch.allclose(cb2.ema_module.weight, cb.ema_module.weight)
@@ -234,3 +254,109 @@ def test_get_param_groups_overrides_config(monkeypatch) -> None:
     assert node._train_config.lr == 1e-4
     assert node._model_config.resolution == 432
     assert groups[0]["lr"] == 2e-4
+
+
+# ------------------------------------------------------------ CPU integration
+def test_integration_fit_with_ema_and_param_groups(tmp_path) -> None:
+    """End-to-end on CPU: a real CuvisPipeline through RFDETRGradientTrainer with
+    EmaCallback — param groups reach the optimizer, training moves the weights,
+    the EMA tracks them and is written on fit end. No rfdetr stack needed."""
+    import pytorch_lightning as pl
+    from cuvis_ai_core.node.node import Node
+    from cuvis_ai_core.pipeline.pipeline import CuvisPipeline
+    from cuvis_ai_core.training.config import OptimizerConfig, TrainingConfig
+    from cuvis_ai_schemas.pipeline import PortSpec
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from cuvis_ai_rfdetr.training import RFDETRGradientTrainer
+
+    class TinyTrainable(Node):
+        INPUT_SPECS = {"data": PortSpec(dtype=torch.float32, shape=(-1, -1))}
+        OUTPUT_SPECS = {"pred": PortSpec(dtype=torch.float32, shape=(-1, -1))}
+
+        def __init__(self, **kwargs):
+            name, stages = Node.consume_base_kwargs(kwargs)
+            super().__init__(name=name, execution_stages=stages, **kwargs)
+            self.model = torch.nn.Linear(4, 2)
+
+        def unfreeze(self):
+            super().unfreeze()
+            for p in self.model.parameters():
+                p.requires_grad_(True)
+
+        def get_param_groups(self, lr, **_):
+            # weight in a half-lr group; bias left for the trainer's leftover path
+            return [{"params": [self.model.weight], "lr": lr * 0.5}]
+
+        def forward(self, data, context=None, **_):
+            return {"pred": self.model(data)}
+
+    class TinyLoss(Node):
+        INPUT_SPECS = {
+            "pred": PortSpec(dtype=torch.float32, shape=(-1, -1)),
+            "target": PortSpec(dtype=torch.float32, shape=(-1, -1)),
+        }
+        OUTPUT_SPECS = {"loss": PortSpec(dtype=torch.float32, shape=())}
+
+        def __init__(self, **kwargs):
+            name, stages = Node.consume_base_kwargs(kwargs)
+            super().__init__(name=name, execution_stages=stages, **kwargs)
+
+        def forward(self, pred, target, context=None, **_):
+            return {"loss": torch.nn.functional.mse_loss(pred, target)}
+
+    class TinyData(pl.LightningDataModule):
+        def _loader(self):
+            ds = TensorDataset(torch.randn(16, 4), torch.randn(16, 2))
+            return DataLoader(
+                ds,
+                batch_size=4,
+                collate_fn=lambda items: {
+                    "data": torch.stack([i[0] for i in items]),
+                    "target": torch.stack([i[1] for i in items]),
+                },
+            )
+
+        train_dataloader = _loader
+        val_dataloader = _loader
+
+    trainable, loss = TinyTrainable(name="tiny"), TinyLoss(name="loss")
+    pipe = CuvisPipeline("tiny_integration")
+    pipe.connect((trainable.outputs.pred, loss.inputs.pred))
+    pipe.unfreeze_nodes_by_name(["tiny"])
+
+    initial = trainable.model.weight.detach().clone()
+    ema_path = tmp_path / "tiny_ema.pth"
+    trainer = RFDETRGradientTrainer(
+        pipeline=pipe,
+        datamodule=TinyData(),
+        loss_nodes=[loss],
+        metric_nodes=[],
+        training_config=TrainingConfig(
+            seed=7,
+            optimizer=OptimizerConfig(name="adamw", lr=1e-2),
+            max_epochs=2,
+            accelerator="cpu",
+            enable_progress_bar=False,
+        ),
+        callbacks=[
+            EmaCallback(
+                node_name="tiny", decay=0.9, tau=0.0, save_path=str(ema_path), ema_cls=_StubEma
+            )
+        ],
+        node_name="tiny",
+    )
+
+    optimizer = trainer.configure_optimizers()
+    assert len(optimizer.param_groups) == 2  # half-lr weight group + leftover bias
+    assert optimizer.param_groups[0]["lr"] == 5e-3
+
+    trainer.fit()
+
+    final = trainable.model.weight.detach()
+    assert not torch.equal(final, initial), "training did not move the weights"
+    assert ema_path.exists()
+    payload = torch.load(ema_path, weights_only=True)
+    ema_weight = payload["model"]["weight"]
+    assert not torch.equal(ema_weight, final), "EMA identical to final weights"
+    assert payload["updates"] > 1
