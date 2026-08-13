@@ -19,14 +19,19 @@ module — so a cuvis-ai run reproduces the native loop's averaging exactly.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytorch_lightning as pl
 import torch
 from cuvis_ai_core.training import GradientTrainer
+from cuvis_ai_schemas.enums import ExecutionStage
+from cuvis_ai_schemas.execution import Context
 
-__all__ = ["EmaCallback", "RFDETRGradientTrainer"]
+__all__ = ["EmaCallback", "MapEvalCallback", "RFDETRGradientTrainer"]
+# (MapEvalCallback is defined after EmaCallback, which it discovers among the
+# trainer callbacks to evaluate the EMA weight stream.)
 
 
 def _find_node(pipeline: Any, node_name: str):
@@ -248,3 +253,168 @@ class EmaCallback(pl.Callback):
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         torch.save(payload, out)
+
+
+def _cxcywh_norm_to_xyxy_abs(boxes: torch.Tensor, size: int) -> torch.Tensor:
+    """Normalized cxcywh (DETR targets) -> absolute xyxy at a square size."""
+    if boxes.numel() == 0:
+        return boxes.reshape(-1, 4)
+    cx, cy, w, h = boxes.unbind(-1)
+    return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1) * float(size)
+
+
+class MapEvalCallback(pl.Callback):
+    """Native RF-DETR best-checkpoint selection for cuvis-ai training runs.
+
+    Each validation epoch, evaluates COCO mAP over the val dataloader for the
+    **regular** weights and — when an :class:`EmaCallback` is present — for the
+    **EMA** weights (swapped in for the pass, restored after), tracks the best
+    value of each stream, and writes the native-style checkpoints:
+    ``checkpoint_best_regular.pth`` / ``checkpoint_best_ema.pth`` /
+    ``checkpoint_best_total.pth`` (best across both streams — the artifact the
+    native loop selects its shipped weights from). A callback rather than a
+    metric node deliberately: it must evaluate two weight sets per epoch, which
+    a streaming metric node cannot.
+
+    mAP is ``map@[.5:.95]`` from torchmetrics' ``MeanAveragePrecision`` with the
+    ``faster_coco_eval`` backend (the evaluator family the native loop uses).
+    Predictions come from rfdetr's own ``PostProcess`` (built from the node's
+    stored model/train configs unless one is injected); ground truth from the
+    node's DETR ``targets``. Both are scaled to the model input resolution, so
+    COCO area buckets stay consistent across checkpoints.
+
+    Parameters
+    ----------
+    node_name : str
+        The ``RFDETRTrainable`` inside the trained pipeline.
+    output_dir : str
+        Where the three checkpoints are written.
+    iou_type : str
+        ``"bbox"`` (default) or ``"segm"`` (needs masks in the postprocess
+        output).
+    postprocess : callable or None
+        ``(outputs, target_sizes) -> list[{boxes, scores, labels}]``. Default:
+        rfdetr's ``PostProcess`` built at fit start (needs the train stack).
+    map_backend : str
+        torchmetrics backend; default ``faster_coco_eval``.
+    """
+
+    def __init__(
+        self,
+        node_name: str = "RFDETR",
+        output_dir: str = ".",
+        iou_type: str = "bbox",
+        postprocess: Callable | None = None,
+        map_backend: str = "faster_coco_eval",
+    ) -> None:
+        super().__init__()
+        self.node_name = str(node_name)
+        self.output_dir = Path(output_dir)
+        self.iou_type = str(iou_type)
+        self.postprocess = postprocess
+        self.map_backend = str(map_backend)
+        self._node = None
+        self._ema: EmaCallback | None = None
+        self.best: dict[str, dict[str, Any]] = {}  # stream -> {"map", "epoch", ...}
+        self.history: list[dict[str, Any]] = []
+
+    # ------------------------------------------------------------- lifecycle
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._node = _find_node(pl_module.pipeline, self.node_name)
+        if self.postprocess is None:
+            try:  # lazy: the train stack
+                from rfdetr.models.lwdetr import build_criterion_from_config
+            except ImportError as exc:  # pragma: no cover - environment-dependent
+                raise ImportError(
+                    "MapEvalCallback needs rfdetr's PostProcess (pip install "
+                    "'rfdetr[train]>=1.8,<2') or an injected `postprocess`."
+                ) from exc
+            _, self.postprocess = build_criterion_from_config(
+                self._node._model_config, self._node._train_config
+            )
+        self._ema = next((cb for cb in trainer.callbacks if isinstance(cb, EmaCallback)), None)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if getattr(trainer, "sanity_checking", False):
+            return
+        epoch = int(trainer.current_epoch)
+
+        self._record("regular", self._evaluate(trainer, pl_module), epoch)
+
+        if self._ema is not None and self._ema.ema is not None:
+            model = self._node.model
+            backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            model.load_state_dict(self._ema.ema_module.state_dict())
+            try:
+                map_ema = self._evaluate(trainer, pl_module)
+            finally:
+                model.load_state_dict(backup)
+            self._record("ema", map_ema, epoch)
+
+    # ------------------------------------------------------------- evaluation
+    def _evaluate(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> float:
+        from torchmetrics.detection import MeanAveragePrecision
+
+        metric = MeanAveragePrecision(iou_type=self.iou_type, backend=self.map_backend)
+        loader = trainer.datamodule.val_dataloader()
+        pipeline = pl_module.pipeline
+        device = next(self._node.model.parameters()).device
+        res = int(getattr(self._node, "_input_resolution", 0)) or 1
+        was_training = self._node.model.training
+        self._node.model.eval()
+        try:
+            with torch.no_grad():
+                for batch in loader:
+                    batch = {
+                        k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
+                    }
+                    out = pipeline.forward(batch=batch, context=Context(stage=ExecutionStage.VAL))
+                    raw = out[(self.node_name, "outputs")]
+                    targets = out[(self.node_name, "targets")]
+                    sizes = torch.tensor([[res, res]] * len(targets), device=device)
+                    results = self.postprocess(raw, sizes)
+                    preds, gts = [], []
+                    for result, target in zip(results, targets, strict=True):
+                        preds.append(
+                            {
+                                "boxes": result["boxes"].detach().cpu(),
+                                "scores": result["scores"].detach().cpu(),
+                                "labels": result["labels"].detach().cpu(),
+                            }
+                        )
+                        gts.append(
+                            {
+                                "boxes": _cxcywh_norm_to_xyxy_abs(target["boxes"], res).cpu(),
+                                "labels": target["labels"].detach().cpu(),
+                            }
+                        )
+                    metric.update(preds, gts)
+        finally:
+            self._node.model.train(was_training)
+        return float(metric.compute()["map"])
+
+    # ------------------------------------------------------------- bookkeeping
+    def _record(self, stream: str, value: float, epoch: int) -> None:
+        """Strict-max per stream + across streams (native BestMetricHolder rule)."""
+        self.history.append({"stream": stream, "map": value, "epoch": epoch})
+        payload = None
+        best_stream = self.best.get(stream)
+        if best_stream is None or value > best_stream["map"]:
+            self.best[stream] = {"map": value, "epoch": epoch}
+            payload = self._payload(stream, value, epoch)
+            torch.save(payload, self.output_dir / f"checkpoint_best_{stream}.pth")
+        best_total = self.best.get("total")
+        if best_total is None or value > best_total["map"]:
+            self.best["total"] = {"map": value, "epoch": epoch, "stream": stream}
+            payload = payload if payload is not None else self._payload(stream, value, epoch)
+            torch.save(payload, self.output_dir / "checkpoint_best_total.pth")
+
+    def _payload(self, stream: str, value: float, epoch: int) -> dict[str, Any]:
+        model = self._node.model if stream == "regular" else self._ema.ema_module
+        return {
+            "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "map": float(value),
+            "epoch": int(epoch),
+            "stream": stream,
+        }
