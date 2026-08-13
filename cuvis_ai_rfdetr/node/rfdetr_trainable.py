@@ -283,9 +283,8 @@ class RFDETRTrainable(Node):
         reproduces the native loop's learning-rate structure.
 
         Overrides default to the wrapper's train config; pass explicit values
-        to match a specific run (e.g. the BonBack champion trained with
-        ``lr=1e-4, lr_encoder=1.5e-4, lr_vit_layer_decay=0.8,
-        lr_component_decay=0.7``).
+        to match a specific run (e.g. a fine-tuning recipe of ``lr=1e-4,
+        lr_encoder=1.5e-4, lr_vit_layer_decay=0.8, lr_component_decay=0.7``).
 
         Like the native trainer's ``args``, the namespace handed to
         ``get_param_dict`` is a flat merge of the **model** config (backbone
