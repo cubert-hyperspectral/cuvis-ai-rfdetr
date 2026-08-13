@@ -9,6 +9,13 @@
   registered LW-DETR module by node name, updates every `update_interval` train batches,
   persists through Lightning checkpoint state (resume-safe), and can write the averaged
   weights on fit end (`save_path`) or on demand (`save()`).
+- `RFDETRGradientTrainer` (`cuvis_ai_rfdetr.training`): a `GradientTrainer` whose
+  `configure_optimizers` feeds the named `RFDETRTrainable`'s native param groups to the standard
+  optimizer/scheduler registry (base lr from the optimizer config; `lr_encoder` /
+  `lr_vit_layer_decay` / `lr_component_decay` as constructor knobs). Other unfrozen pipeline
+  parameters join as a final base-lr group, preserving the base trainer's optimize-everything
+  contract. Kept in this plugin by design (no cuvis-ai-core change); candidate for later
+  migration into `GradientTrainer` as an optional node param-group protocol.
 - `RFDETRTrainable.get_param_groups(...)`: the native LW-DETR optimizer param groups
   (encoder at `lr_encoder` with per-block ViT layer decay, decoder at
   `lr * lr_component_decay`, rest at `lr`) built by rfdetr's own `get_param_dict` against the

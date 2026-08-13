@@ -134,6 +134,66 @@ def test_state_roundtrip_restores_average(tmp_path) -> None:
     assert set(payload) == {"model", "updates"}
 
 
+def test_rfdetr_gradient_trainer_builds_grouped_optimizer() -> None:
+    from cuvis_ai_core.training.config import OptimizerConfig, TrainingConfig
+
+    from cuvis_ai_rfdetr.training import RFDETRGradientTrainer
+
+    p_grouped = torch.nn.Parameter(torch.zeros(2))
+    p_extra = torch.nn.Parameter(torch.zeros(3))
+    p_frozen = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+    class _TrainableStub:
+        name = "RFDETR"
+
+        @staticmethod
+        def get_param_groups(lr, lr_encoder=None, lr_vit_layer_decay=None, lr_component_decay=None):
+            assert lr == 1e-4  # base lr comes from the optimizer config
+            assert lr_encoder == 1.5e-4  # constructor knob forwarded
+            return [{"params": [p_grouped], "lr": 5e-5}]
+
+    pipeline = SimpleNamespace(
+        nodes=[_TrainableStub()],
+        parameters=lambda: iter([p_grouped, p_extra, p_frozen]),
+    )
+
+    trainer = RFDETRGradientTrainer.__new__(RFDETRGradientTrainer)  # skip Lightning init
+    cfg = TrainingConfig(optimizer=OptimizerConfig(name="adamw", lr=1e-4))
+    for attr, value in {
+        "pipeline": pipeline,
+        "optimizer_config": cfg.optimizer,
+        "scheduler_config": None,
+        "training_config": cfg,
+        "node_name": "RFDETR",
+        "_group_overrides": {
+            "lr_encoder": 1.5e-4,
+            "lr_vit_layer_decay": None,
+            "lr_component_decay": None,
+        },
+    }.items():
+        object.__setattr__(trainer, attr, value)
+
+    optimizer = trainer.configure_optimizers()
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert len(optimizer.param_groups) == 2
+    assert optimizer.param_groups[0]["lr"] == 5e-5
+    assert optimizer.param_groups[0]["params"] == [p_grouped]
+    assert optimizer.param_groups[1]["params"] == [p_extra]  # trainable leftover, base lr
+    assert optimizer.param_groups[1]["lr"] == 1e-4
+    # the frozen parameter is optimized by neither group
+    assert all(p_frozen is not q for g in optimizer.param_groups for q in g["params"])
+
+
+def test_rfdetr_gradient_trainer_requires_param_group_node() -> None:
+    from cuvis_ai_rfdetr.training import RFDETRGradientTrainer
+
+    trainer = RFDETRGradientTrainer.__new__(RFDETRGradientTrainer)
+    object.__setattr__(trainer, "pipeline", SimpleNamespace(nodes=[SimpleNamespace(name="RFDETR")]))
+    object.__setattr__(trainer, "node_name", "RFDETR")
+    with pytest.raises(RuntimeError, match="get_param_groups"):
+        trainer.configure_optimizers()
+
+
 @needs_train_stack
 def test_get_param_groups_overrides_config(monkeypatch) -> None:
     from cuvis_ai_rfdetr.node import rfdetr_trainable as mod

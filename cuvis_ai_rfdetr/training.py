@@ -24,8 +24,95 @@ from typing import Any
 
 import pytorch_lightning as pl
 import torch
+from cuvis_ai_core.training import GradientTrainer
 
-__all__ = ["EmaCallback"]
+__all__ = ["EmaCallback", "RFDETRGradientTrainer"]
+
+
+def _find_node(pipeline: Any, node_name: str):
+    """Return the pipeline node called ``node_name`` or raise a clear error."""
+    for node in pipeline.nodes:
+        if getattr(node, "name", None) == node_name:
+            return node
+    raise RuntimeError(f"no node named {node_name!r} in the pipeline.")
+
+
+class RFDETRGradientTrainer(GradientTrainer):
+    """``GradientTrainer`` whose optimizer uses the native RF-DETR param groups.
+
+    ``configure_optimizers`` asks the named ``RFDETRTrainable`` for its native
+    param groups (:meth:`RFDETRTrainable.get_param_groups` — encoder at
+    ``lr_encoder`` with ViT layer decay, decoder at ``lr * lr_component_decay``,
+    rest at the base lr) and feeds them to the standard optimizer/scheduler
+    registry, so everything else (optimizer type, weight decay, scheduler,
+    callbacks) behaves exactly like the base trainer. Any *other* unfrozen
+    pipeline parameters not covered by the node's groups are appended as a
+    final base-lr group, preserving the base trainer's "optimize everything
+    trainable" contract.
+
+    The base learning rate is taken from ``training_config.optimizer.lr``; the
+    three structural knobs are constructor arguments (defaults = the wrapper's
+    train config; the BonBack champion trained with ``lr_encoder=1.5e-4,
+    lr_vit_layer_decay=0.8, lr_component_decay=0.7``).
+
+    This lives in the plugin (not cuvis-ai-core) by design for now — candidate
+    for later migration into ``GradientTrainer`` as an optional node
+    param-group protocol.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        node_name: str = "RFDETR",
+        lr_encoder: float | None = None,
+        lr_vit_layer_decay: float | None = None,
+        lr_component_decay: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.node_name = str(node_name)
+        self._group_overrides = {
+            "lr_encoder": lr_encoder,
+            "lr_vit_layer_decay": lr_vit_layer_decay,
+            "lr_component_decay": lr_component_decay,
+        }
+
+    def configure_optimizers(self):
+        from cuvis_ai_core.training.optimizer_registry import (
+            create_optimizer,
+            create_scheduler,
+            wrap_scheduler_for_lightning,
+        )
+
+        node = _find_node(self.pipeline, self.node_name)
+        if not hasattr(node, "get_param_groups"):
+            raise RuntimeError(
+                f"RFDETRGradientTrainer: node {self.node_name!r} has no "
+                "get_param_groups — expected an RFDETRTrainable."
+            )
+        groups = node.get_param_groups(lr=self.optimizer_config.lr, **self._group_overrides)
+        # Preserve the base contract: every trainable pipeline parameter is
+        # optimized. Anything outside the node's groups joins at the base lr.
+        grouped = {
+            id(p)
+            for g in groups
+            for p in (g["params"] if isinstance(g["params"], (list, tuple)) else [g["params"]])
+        }
+        extras = [p for p in self.pipeline.parameters() if p.requires_grad and id(p) not in grouped]
+        if extras:
+            groups = [*groups, {"params": extras}]
+
+        optimizer = create_optimizer(self.optimizer_config, groups)
+        scheduler = create_scheduler(
+            self.scheduler_config, optimizer, self.training_config.max_epochs
+        )
+        if scheduler is None:
+            return optimizer
+        monitor = self.scheduler_config.monitor if self.scheduler_config else None
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": wrap_scheduler_for_lightning(scheduler, monitor),
+        }
 
 
 class EmaCallback(pl.Callback):
@@ -79,15 +166,16 @@ class EmaCallback(pl.Callback):
                 "EmaCallback expects the LightningModule to expose `.pipeline` "
                 "(cuvis-ai GradientTrainer does)."
             )
-        for node in pipeline.nodes:
-            if getattr(node, "name", None) == self.node_name:
-                if not hasattr(node, "model"):
-                    raise RuntimeError(
-                        f"EmaCallback: node {self.node_name!r} has no `.model` "
-                        "submodule — expected an RFDETRTrainable."
-                    )
-                return node
-        raise RuntimeError(f"EmaCallback: no node named {self.node_name!r} in the pipeline.")
+        try:
+            node = _find_node(pipeline, self.node_name)
+        except RuntimeError as exc:
+            raise RuntimeError(f"EmaCallback: {exc}") from None
+        if not hasattr(node, "model"):
+            raise RuntimeError(
+                f"EmaCallback: node {self.node_name!r} has no `.model` "
+                "submodule — expected an RFDETRTrainable."
+            )
+        return node
 
     # ------------------------------------------------------------- lifecycle
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
