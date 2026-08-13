@@ -57,7 +57,7 @@ class RFDETRGradientTrainer(GradientTrainer):
 
     The base learning rate is taken from ``training_config.optimizer.lr``; the
     three structural knobs are constructor arguments (defaults = the wrapper's
-    train config; the BonBack champion trained with ``lr_encoder=1.5e-4,
+    train config; e.g. a typical fine-tuning recipe uses ``lr_encoder=1.5e-4,
     lr_vit_layer_decay=0.8, lr_component_decay=0.7``).
 
     This lives in the plugin (not cuvis-ai-core) by design for now — candidate
