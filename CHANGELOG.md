@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+- `EmaCallback` (`cuvis_ai_rfdetr.training`): the native RF-DETR weight EMA as a Lightning
+  callback for cuvis-ai's `GradientTrainer` (which accepts explicit callbacks). Wraps rfdetr's
+  own `ModelEma` (decay warm-up `decay*(1-exp(-updates/tau))`), targets the `RFDETRTrainable`'s
+  registered LW-DETR module by node name, updates every `update_interval` train batches,
+  persists through Lightning checkpoint state (resume-safe), and can write the averaged
+  weights on fit end (`save_path`) or on demand (`save()`).
+- `RFDETRTrainable.get_param_groups(...)`: the native LW-DETR optimizer param groups
+  (encoder at `lr_encoder` with per-block ViT layer decay, decoder at
+  `lr * lr_component_decay`, rest at `lr`) built by rfdetr's own `get_param_dict` against the
+  node's model. Like the native trainer's `args`, the namespace handed to `get_param_dict` is
+  a flat merge of the model config (e.g. `out_feature_indexes`) and the train config, with
+  explicit overrides on top. Feed the returned param-group dicts to a torch optimizer to
+  reproduce the native loop's learning-rate structure.
+
 ## [0.3.0] - 2026-08-10
 
 ### Added

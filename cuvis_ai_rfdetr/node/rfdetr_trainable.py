@@ -193,6 +193,11 @@ class RFDETRTrainable(Node):
                 f"{getattr(model_config, 'num_channels', 3)} but {self.num_channels} requested."
             )
         train_config = wrapper.get_train_config(dataset_dir=self.dataset_dir, epochs=1)
+        # Kept for get_param_groups: the native param-group builder reads a flat
+        # args namespace mixing BOTH configs (lr knobs from the train config,
+        # backbone fields like out_feature_indexes from the model config).
+        self._model_config = model_config
+        self._train_config = train_config
         module = RFDETRModelModule(model_config, train_config)
         # Registered submodule: parameters/state_dict flow through the pipeline.
         self.model = module.model
@@ -255,6 +260,56 @@ class RFDETRTrainable(Node):
         for p in self.model.parameters():
             p.requires_grad_(False)
         super().freeze()
+
+    def get_param_groups(
+        self,
+        lr: float | None = None,
+        lr_encoder: float | None = None,
+        lr_vit_layer_decay: float | None = None,
+        lr_component_decay: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Native LW-DETR optimizer param groups for this node's model.
+
+        Delegates to rfdetr's own ``get_param_dict`` — the exact grouping the
+        Roboflow trainer uses: encoder params at ``lr_encoder`` with per-block
+        ViT layer decay (``lr_vit_layer_decay``), decoder params at
+        ``lr * lr_component_decay``, everything else at ``lr``. Feed the result
+        to a torch optimizer (param-group dicts) so a cuvis-ai training run
+        reproduces the native loop's learning-rate structure.
+
+        Overrides default to the wrapper's train config; pass explicit values
+        to match a specific run (e.g. the BonBack champion trained with
+        ``lr=1e-4, lr_encoder=1.5e-4, lr_vit_layer_decay=0.8,
+        lr_component_decay=0.7``).
+
+        Like the native trainer's ``args``, the namespace handed to
+        ``get_param_dict`` is a flat merge of the **model** config (backbone
+        fields such as ``out_feature_indexes``) and the **train** config (lr
+        knobs), with explicit overrides on top.
+        """
+        from types import SimpleNamespace
+
+        try:  # lazy: importing rfdetr.training pulls the full train stack
+            from rfdetr.training.param_groups import get_param_dict
+        except ImportError as exc:  # pragma: no cover - environment-dependent
+            raise ImportError(
+                "get_param_groups requires the rfdetr train stack: "
+                "pip install 'rfdetr[train]>=1.8,<2'"
+            ) from exc
+
+        overrides = {
+            "lr": lr,
+            "lr_encoder": lr_encoder,
+            "lr_vit_layer_decay": lr_vit_layer_decay,
+            "lr_component_decay": lr_component_decay,
+        }
+        overrides = {k: float(v) for k, v in overrides.items() if v is not None}
+
+        def as_dict(cfg: Any) -> dict[str, Any]:
+            return dict(cfg.model_dump()) if hasattr(cfg, "model_dump") else dict(vars(cfg))
+
+        merged = {**as_dict(self._model_config), **as_dict(self._train_config), **overrides}
+        return get_param_dict(SimpleNamespace(**merged), self.model)
 
     def forward(
         self,
