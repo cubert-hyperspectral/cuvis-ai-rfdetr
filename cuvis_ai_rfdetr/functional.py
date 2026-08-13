@@ -13,6 +13,29 @@ import torch
 from torch import Tensor
 
 
+def compute_multi_scale_scales(
+    resolution: int,
+    expanded_scales: bool = False,
+    patch_size: int = 16,
+    num_windows: int = 4,
+) -> list[int]:
+    """The native RF-DETR multi-scale training sizes for a given resolution.
+
+    Faithful reimplementation of ``rfdetr.datasets.coco.compute_multi_scale_scales``
+    (kept here so the transform module stays importable without the rfdetr train
+    stack; equality against the native function is unit-tested). Sizes are
+    multiples of ``patch_size * num_windows`` — the model's spatial divisibility
+    unit — centred on ``resolution``: offsets ``[-3..4]`` (or ``[-5..5]`` with
+    ``expanded_scales``) around ``resolution // (patch_size * num_windows)``,
+    with a minimum of two units.
+    """
+    unit = patch_size * num_windows
+    base = resolution // unit
+    offsets = [-3, -2, -1, 0, 1, 2, 3, 4] if not expanded_scales else list(range(-5, 6))
+    proposed = [(base + off) * unit for off in offsets]
+    return [scale for scale in proposed if scale >= unit * 2]
+
+
 def box_iou(a, b) -> float:
     """IoU of two ``[x1, y1, x2, y2]`` boxes (plain floats, no torch)."""
     ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])

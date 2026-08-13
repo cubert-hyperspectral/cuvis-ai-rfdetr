@@ -14,7 +14,7 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from torch import Tensor
 
-from cuvis_ai_rfdetr.functional import targets_from_mask
+from cuvis_ai_rfdetr.functional import compute_multi_scale_scales, targets_from_mask
 
 #: Detection tier (Apache-2.0 sizes only — XL/2XL detection is platform-licensed).
 _DET_CLASS_NAMES: dict[str, str] = {
@@ -202,6 +202,11 @@ class RFDETRTrainable(Node):
         # Registered submodule: parameters/state_dict flow through the pipeline.
         self.model = module.model
         self._input_resolution = int(model_config.resolution)
+        # The model's spatial divisibility unit (windowed attention): inputs whose
+        # side is a multiple of this are valid without resizing (multi-scale train).
+        self._spatial_unit = int(getattr(model_config, "patch_size", 16)) * int(
+            getattr(model_config, "num_windows", 4)
+        )
 
         # rfdetr's num_channels config is NOT propagated to the DINOv2 patch-embed
         # (its conv + assert stay at 3). Inflate the pretrained RGB patch-embed
@@ -326,11 +331,12 @@ class RFDETRTrainable(Node):
             )
         from rfdetr.util.misc import NestedTensor  # lazy: heavy package
 
-        res = self._input_resolution
+        stage = context.stage if context is not None else None
         x = rgb_image.permute(0, 3, 1, 2)  # BHWC -> BCHW
-        x = F.interpolate(x, size=(res, res), mode="bilinear", align_corners=False)
+        x = self._resize_for_stage(x, stage)
         x = (x - self._means) / self._stds
-        mask = torch.zeros(x.shape[0], res, res, dtype=torch.bool, device=x.device)
+        side_h, side_w = int(x.shape[-2]), int(x.shape[-1])
+        mask = torch.zeros(x.shape[0], side_h, side_w, dtype=torch.bool, device=x.device)
         samples = NestedTensor(x, mask)
 
         targets: list[dict[str, Tensor]] = []
@@ -338,7 +344,6 @@ class RFDETRTrainable(Node):
             targets = targets_from_mask(targets_mask, with_masks=self.segmentation)
             targets = [{k: v.to(x.device) for k, v in t.items()} for t in targets]
 
-        stage = context.stage if context is not None else None
         if (stage == ExecutionStage.TRAIN or self.training) and targets_mask is None:
             raise RuntimeError(
                 "RFDETRTrainable: targets_mask is required in TRAIN "
@@ -347,3 +352,39 @@ class RFDETRTrainable(Node):
 
         outputs = self.model(samples, targets if targets else None)
         return {"outputs": outputs, "targets": targets}
+
+    def _resize_for_stage(self, x: Tensor, stage: ExecutionStage | None) -> Tensor:
+        """Resize BCHW input to the model resolution — except multi-scale train input.
+
+        At TRAIN (stage or ``module.training``), an already-square input whose
+        side is a multiple of the model's spatial unit
+        (``patch_size * num_windows``) passes through unresized — this is what
+        lets ``RandomMultiScaleResize`` feed true multi-scale sizes to the
+        model, exactly like the native dataloader. Everything else — all
+        val/test/inference input, and train input at arbitrary sizes — gets the
+        fixed resize to the model resolution, unchanged behavior.
+        """
+        h, w = int(x.shape[-2]), int(x.shape[-1])
+        in_train = stage == ExecutionStage.TRAIN or self.training
+        if in_train and h == w and h % self._spatial_unit == 0:
+            return x
+        res = self._input_resolution
+        return F.interpolate(x, size=(res, res), mode="bilinear", align_corners=False)
+
+    def multi_scale_scales(self, expanded_scales: bool | None = None) -> list[int]:
+        """The native multi-scale training sizes for THIS model's configuration.
+
+        Reads ``resolution`` / ``patch_size`` / ``num_windows`` from the built
+        model config (``expanded_scales`` defaults to the wrapper train
+        config's setting) — hand the result to ``RandomMultiScaleResize`` so
+        the transform draws from exactly the sizes the native dataloader would.
+        """
+        if expanded_scales is None:
+            expanded_scales = bool(getattr(self._train_config, "expanded_scales", False))
+        mc = self._model_config
+        return compute_multi_scale_scales(
+            int(mc.resolution),
+            expanded_scales=bool(expanded_scales),
+            patch_size=int(getattr(mc, "patch_size", 16)),
+            num_windows=int(getattr(mc, "num_windows", 4)),
+        )
