@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### Added
+- `RandomMultiScaleResize` (`cuvis_ai_rfdetr.transforms`): the native RF-DETR multi-scale
+  training resize as a cuvis-ai-augment transform, contributed through augment's
+  `extra_transform_modules` mechanism (no augment change; cuvis-ai-augment is deliberately not a
+  pip dependency — the module import raises a clear hint when it is absent). Draws one square
+  size per batch from the native scale set; cube bilinear, mask nearest. Scale math lives in
+  `functional.compute_multi_scale_scales` (faithful reimplementation, unit-tested for equality
+  against rfdetr's own function) and `RFDETRTrainable.multi_scale_scales()` returns the set for
+  the node's actual model config (e.g. SegMedium@624: patch 12 × windows 2 → unit 24).
+- `RFDETRTrainable` stage-aware input resize: at TRAIN, an already-square input whose side is a
+  multiple of the model's spatial unit (`patch_size * num_windows`) passes through unresized —
+  making upstream multi-scale augmentation real instead of being nullified by the fixed resize.
+  Val/test/inference input and arbitrary-size train input keep the fixed model-resolution
+  resize (unchanged behavior).
 - `EmaCallback` (`cuvis_ai_rfdetr.training`): the native RF-DETR weight EMA as a Lightning
   callback for cuvis-ai's `GradientTrainer` (which accepts explicit callbacks). Wraps rfdetr's
   own `ModelEma` (decay warm-up `decay*(1-exp(-updates/tau))`), targets the `RFDETRTrainable`'s
