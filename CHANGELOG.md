@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- `RFDETRTrainable` gained `checkpoint_loader` (`"constructor"` default | `"from_checkpoint"`),
+  mirroring the inference nodes: `"from_checkpoint"` delegates to `rfdetr.RFDETR.from_checkpoint`,
+  so the wrapper class and configuration (including the query structure) come from the checkpoint
+  itself, with the resolved class validated against `variant`/`segmentation` and `resolution`
+  forwarded. Verified tensor-exact against a fine-tuned segmentation checkpoint; note the generic
+  constructor path also loads default-config checkpoints exactly — the loader-faithful path
+  matters for checkpoints trained at non-default model configs. Incompatible with
+  `num_channels != 3` (no channel-inflation in rfdetr's loader; validated).
 - `RandomMultiScaleResize` (`cuvis_ai_rfdetr.transforms`): the native RF-DETR multi-scale
   training resize as a cuvis-ai-augment transform, contributed through augment's
   `extra_transform_modules` mechanism (no augment change; cuvis-ai-augment is deliberately not a

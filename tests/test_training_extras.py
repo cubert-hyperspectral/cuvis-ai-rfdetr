@@ -360,3 +360,53 @@ def test_integration_fit_with_ema_and_param_groups(tmp_path) -> None:
     ema_weight = payload["model"]["weight"]
     assert not torch.equal(ema_weight, final), "EMA identical to final weights"
     assert payload["updates"] > 1
+
+
+# ------------------------------------------------- checkpoint_loader (fidelity)
+def test_trainable_checkpoint_loader_validation() -> None:
+    from cuvis_ai_rfdetr.node.rfdetr_trainable import RFDETRTrainable
+
+    with pytest.raises(ValueError, match="checkpoint_loader must be"):
+        RFDETRTrainable(dataset_dir="x", checkpoint_loader="bogus")
+    with pytest.raises(ValueError, match="num_channels=3"):
+        RFDETRTrainable(
+            dataset_dir="x",
+            checkpoint_path="ck.pth",
+            checkpoint_loader="from_checkpoint",
+            num_channels=6,
+        )
+
+
+@needs_train_stack
+def test_trainable_from_checkpoint_forwards_kwargs_and_validates_class(monkeypatch) -> None:
+    import rfdetr
+
+    from cuvis_ai_rfdetr.node.rfdetr_trainable import RFDETRTrainable
+
+    captured: dict = {}
+
+    class _WrongClass:  # resolved class name will not match the requested variant
+        pass
+
+    def fake_from_checkpoint(path, **kwargs):
+        captured["path"] = path
+        captured["kwargs"] = kwargs
+        return _WrongClass()
+
+    monkeypatch.setattr(
+        rfdetr.RFDETR,
+        "from_checkpoint",
+        classmethod(lambda cls, path, **kw: fake_from_checkpoint(path, **kw)),
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint resolved to _WrongClass"):
+        RFDETRTrainable(
+            dataset_dir="x",
+            checkpoint_path="champion.pth",
+            variant="medium",
+            segmentation=True,
+            resolution=624,
+            checkpoint_loader="from_checkpoint",
+        )
+    assert captured["path"] == "champion.pth"
+    assert captured["kwargs"] == {"resolution": 624}  # loader kwargs forwarded
