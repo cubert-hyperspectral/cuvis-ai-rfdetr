@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-14
+
 ### Added
 - `RFDETRTrainable` gained `checkpoint_loader` (`"constructor"` default | `"from_checkpoint"`),
   mirroring the inference nodes: `"from_checkpoint"` delegates to `rfdetr.RFDETR.from_checkpoint`,
