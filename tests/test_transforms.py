@@ -1,0 +1,183 @@
+"""Tests for RandomMultiScaleResize, the scale math, and the stage-aware resize.
+
+The scale formula is unit-tested for exact equality against rfdetr's native
+``compute_multi_scale_scales`` (where the train stack is installed). Transform
+tests need cuvis-ai-augment (the registry/base) and skip where it is absent —
+same convention as the train-stack skips.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from cuvis_ai_rfdetr.functional import compute_multi_scale_scales
+
+try:
+    import cuvis_ai_augment  # noqa: F401
+
+    AUGMENT = True
+except ImportError:  # pragma: no cover
+    AUGMENT = False
+
+try:
+    from rfdetr.datasets.coco import compute_multi_scale_scales as native_scales
+
+    TRAIN_STACK = True
+except ImportError:  # pragma: no cover
+    TRAIN_STACK = False
+
+needs_augment = pytest.mark.skipif(not AUGMENT, reason="needs cuvis-ai-augment")
+needs_train_stack = pytest.mark.skipif(not TRAIN_STACK, reason="needs rfdetr train stack")
+
+
+# --------------------------------------------------------------- scale formula
+def test_scales_champion_config() -> None:
+    # SegMedium@624: patch 12 x windows 2 -> unit 24; expanded -> 11 sizes incl. 624
+    scales = compute_multi_scale_scales(624, expanded_scales=True, patch_size=12, num_windows=2)
+    assert scales == [504, 528, 552, 576, 600, 624, 648, 672, 696, 720, 744]
+    assert all(s % 24 == 0 for s in scales)
+
+
+def test_scales_min_size_filter() -> None:
+    # tiny resolution: offsets below two units are filtered out
+    scales = compute_multi_scale_scales(128, expanded_scales=True, patch_size=16, num_windows=4)
+    assert scales and all(s >= 128 for s in scales)
+
+
+@needs_train_stack
+@pytest.mark.parametrize(
+    ("resolution", "expanded", "patch", "windows"),
+    [
+        (624, True, 12, 2),
+        (624, False, 12, 2),
+        (432, True, 12, 2),
+        (560, True, 16, 4),
+        (128, True, 16, 4),
+    ],
+)
+def test_scales_match_native(resolution: int, expanded: bool, patch: int, windows: int) -> None:
+    ours = compute_multi_scale_scales(resolution, expanded, patch, windows)
+    theirs = native_scales(resolution, expanded, patch, windows)
+    assert ours == theirs
+
+
+# --------------------------------------------------------------- the transform
+@needs_augment
+def test_registered_and_buildable() -> None:
+    from cuvis_ai_augment.transforms.base import build_transform
+
+    import cuvis_ai_rfdetr.transforms  # noqa: F401 — registers on import
+
+    t = build_transform({"type": "RandomMultiScaleResize", "scales": [96, 120]})
+    assert t.scales == [96, 120]
+
+
+@needs_augment
+def test_resizes_cube_and_mask_to_one_scale() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(scales=[96, 120, 144])
+    cube = torch.rand(2, 64, 80, 5)
+    mask = torch.randint(0, 3, (2, 64, 80), dtype=torch.int32)
+    rng = torch.Generator().manual_seed(7)
+    out_cube, out_mask = t(cube, mask, rng)
+    size = out_cube.shape[1]
+    assert size in (96, 120, 144)
+    assert out_cube.shape == (2, size, size, 5)
+    assert out_mask.shape == (2, size, size)
+    assert out_mask.dtype == torch.int32
+    # nearest-neighbour: no new label values invented
+    assert set(out_mask.unique().tolist()) <= set(mask.unique().tolist())
+
+
+@needs_augment
+def test_deterministic_under_seed() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(scales=[96, 120, 144, 168])
+    cube = torch.rand(1, 50, 50, 3)
+    a, _ = t(cube, None, torch.Generator().manual_seed(123))
+    b, _ = t(cube, None, torch.Generator().manual_seed(123))
+    assert a.shape == b.shape
+    assert torch.equal(a, b)
+
+
+@needs_augment
+def test_prob_zero_is_passthrough() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(scales=[96], prob=0.0)
+    cube = torch.rand(1, 33, 44, 2)
+    out, _ = t(cube, None, torch.Generator().manual_seed(0))
+    assert torch.equal(out, cube)
+
+
+@needs_augment
+def test_scales_computed_from_resolution() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(resolution=624, expanded_scales=True, patch_size=12, num_windows=2)
+    assert 624 in t.scales and len(t.scales) == 11
+    with pytest.raises(ValueError, match="scales=.*or resolution"):
+        RandomMultiScaleResize()
+
+
+# ------------------------------------------------- trainable stage-aware resize
+def _bare_trainable():
+    from cuvis_ai_rfdetr.node.rfdetr_trainable import RFDETRTrainable
+
+    node = RFDETRTrainable.__new__(RFDETRTrainable)
+    for attr, value in {
+        "_input_resolution": 432,
+        "_spatial_unit": 24,
+        "training": False,
+        "_model_config": SimpleNamespace(resolution=624, patch_size=12, num_windows=2),
+        "_train_config": SimpleNamespace(expanded_scales=True),
+    }.items():
+        object.__setattr__(node, attr, value)
+    return node
+
+
+def test_resize_for_stage_multi_scale_train_passthrough() -> None:
+    from cuvis_ai_schemas.enums import ExecutionStage
+
+    node = _bare_trainable()
+    x = torch.rand(1, 3, 480, 480)  # 480 % 24 == 0
+    assert node._resize_for_stage(x, ExecutionStage.TRAIN) is x
+
+
+def test_resize_for_stage_train_arbitrary_size_resizes() -> None:
+    from cuvis_ai_schemas.enums import ExecutionStage
+
+    node = _bare_trainable()
+    x = torch.rand(1, 3, 405, 405)  # 405 % 24 != 0 -> fixed resize (P6 trainrun path)
+    out = node._resize_for_stage(x, ExecutionStage.TRAIN)
+    assert out.shape[-2:] == (432, 432)
+
+
+def test_resize_for_stage_inference_always_fixed() -> None:
+    from cuvis_ai_schemas.enums import ExecutionStage
+
+    node = _bare_trainable()
+    x = torch.rand(1, 3, 480, 480)  # divisible, but NOT train -> certified fixed resize
+    out = node._resize_for_stage(x, ExecutionStage.INFERENCE)
+    assert out.shape[-2:] == (432, 432)
+
+
+def test_resize_for_stage_module_training_flag() -> None:
+    node = _bare_trainable()
+    object.__setattr__(node, "training", True)
+    x = torch.rand(1, 3, 456, 456)  # 456 % 24 == 0
+    assert node._resize_for_stage(x, None) is x
+
+
+def test_multi_scale_scales_reads_model_config() -> None:
+    node = _bare_trainable()
+    scales = node.multi_scale_scales()
+    assert scales == compute_multi_scale_scales(624, True, 12, 2)
+    assert node.multi_scale_scales(expanded_scales=False) == compute_multi_scale_scales(
+        624, False, 12, 2
+    )

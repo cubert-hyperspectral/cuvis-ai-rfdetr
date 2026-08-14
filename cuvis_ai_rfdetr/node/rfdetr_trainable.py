@@ -14,7 +14,7 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from torch import Tensor
 
-from cuvis_ai_rfdetr.functional import targets_from_mask
+from cuvis_ai_rfdetr.functional import compute_multi_scale_scales, targets_from_mask
 
 #: Detection tier (Apache-2.0 sizes only — XL/2XL detection is platform-licensed).
 _DET_CLASS_NAMES: dict[str, str] = {
@@ -197,10 +197,20 @@ class RFDETRTrainable(Node):
                 f"{getattr(model_config, 'num_channels', 3)} but {self.num_channels} requested."
             )
         train_config = wrapper.get_train_config(dataset_dir=self.dataset_dir, epochs=1)
+        # Kept for get_param_groups: the native param-group builder reads a flat
+        # args namespace mixing BOTH configs (lr knobs from the train config,
+        # backbone fields like out_feature_indexes from the model config).
+        self._model_config = model_config
+        self._train_config = train_config
         module = RFDETRModelModule(model_config, train_config)
         # Registered submodule: parameters/state_dict flow through the pipeline.
         self.model = module.model
         self._input_resolution = int(model_config.resolution)
+        # The model's spatial divisibility unit (windowed attention): inputs whose
+        # side is a multiple of this are valid without resizing (multi-scale train).
+        self._spatial_unit = int(getattr(model_config, "patch_size", 16)) * int(
+            getattr(model_config, "num_windows", 4)
+        )
 
         # rfdetr's num_channels config is NOT propagated to the DINOv2 patch-embed
         # (its conv + assert stay at 3). Inflate the pretrained RGB patch-embed
@@ -260,6 +270,55 @@ class RFDETRTrainable(Node):
             p.requires_grad_(False)
         super().freeze()
 
+    def get_param_groups(
+        self,
+        lr: float | None = None,
+        lr_encoder: float | None = None,
+        lr_vit_layer_decay: float | None = None,
+        lr_component_decay: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Native LW-DETR optimizer param groups for this node's model.
+
+        Delegates to rfdetr's own ``get_param_dict`` — the exact grouping the
+        Roboflow trainer uses: encoder params at ``lr_encoder`` with per-block
+        ViT layer decay (``lr_vit_layer_decay``), decoder params at
+        ``lr * lr_component_decay``, everything else at ``lr``. Feed the result
+        to a torch optimizer (param-group dicts) so a cuvis-ai training run
+        reproduces the native loop's learning-rate structure.
+
+        Overrides default to the wrapper's train config; pass explicit values
+        to match a specific run (e.g. a fine-tuning recipe of ``lr=1e-4,
+        lr_encoder=1.5e-4, lr_vit_layer_decay=0.8, lr_component_decay=0.7``).
+
+        Like the native trainer's ``args``, the namespace handed to
+        ``get_param_dict`` is a flat merge of the **model** config (backbone
+        fields such as ``out_feature_indexes``) and the **train** config (lr
+        knobs), with explicit overrides on top.
+        """
+        from types import SimpleNamespace
+
+        try:  # lazy: importing rfdetr.training pulls the full train stack
+            from rfdetr.training.param_groups import get_param_dict
+        except ImportError as exc:  # pragma: no cover - environment-dependent
+            raise ImportError(
+                "get_param_groups requires the rfdetr train stack: "
+                "pip install 'rfdetr[train]>=1.8,<2'"
+            ) from exc
+
+        overrides = {
+            "lr": lr,
+            "lr_encoder": lr_encoder,
+            "lr_vit_layer_decay": lr_vit_layer_decay,
+            "lr_component_decay": lr_component_decay,
+        }
+        overrides = {k: float(v) for k, v in overrides.items() if v is not None}
+
+        def as_dict(cfg: Any) -> dict[str, Any]:
+            return dict(cfg.model_dump()) if hasattr(cfg, "model_dump") else dict(vars(cfg))
+
+        merged = {**as_dict(self._model_config), **as_dict(self._train_config), **overrides}
+        return get_param_dict(SimpleNamespace(**merged), self.model)
+
     def forward(
         self,
         rgb_image: Tensor,
@@ -275,11 +334,12 @@ class RFDETRTrainable(Node):
             )
         from rfdetr.util.misc import NestedTensor  # lazy: heavy package
 
-        res = self._input_resolution
+        stage = context.stage if context is not None else None
         x = rgb_image.permute(0, 3, 1, 2)  # BHWC -> BCHW
-        x = F.interpolate(x, size=(res, res), mode="bilinear", align_corners=False)
+        x = self._resize_for_stage(x, stage)
         x = (x - self._means) / self._stds
-        mask = torch.zeros(x.shape[0], res, res, dtype=torch.bool, device=x.device)
+        side_h, side_w = int(x.shape[-2]), int(x.shape[-1])
+        mask = torch.zeros(x.shape[0], side_h, side_w, dtype=torch.bool, device=x.device)
         samples = NestedTensor(x, mask)
 
         targets: list[dict[str, Tensor]] = []
@@ -287,7 +347,6 @@ class RFDETRTrainable(Node):
             targets = targets_from_mask(targets_mask, with_masks=self.segmentation)
             targets = [{k: v.to(x.device) for k, v in t.items()} for t in targets]
 
-        stage = context.stage if context is not None else None
         if (stage == ExecutionStage.TRAIN or self.training) and targets_mask is None:
             raise RuntimeError(
                 "RFDETRTrainable: targets_mask is required in TRAIN "
@@ -296,3 +355,39 @@ class RFDETRTrainable(Node):
 
         outputs = self.model(samples, targets if targets else None)
         return {"outputs": outputs, "targets": targets}
+
+    def _resize_for_stage(self, x: Tensor, stage: ExecutionStage | None) -> Tensor:
+        """Resize BCHW input to the model resolution — except multi-scale train input.
+
+        At TRAIN (stage or ``module.training``), an already-square input whose
+        side is a multiple of the model's spatial unit
+        (``patch_size * num_windows``) passes through unresized — this is what
+        lets ``RandomMultiScaleResize`` feed true multi-scale sizes to the
+        model, exactly like the native dataloader. Everything else — all
+        val/test/inference input, and train input at arbitrary sizes — gets the
+        fixed resize to the model resolution, unchanged behavior.
+        """
+        h, w = int(x.shape[-2]), int(x.shape[-1])
+        in_train = stage == ExecutionStage.TRAIN or self.training
+        if in_train and h == w and h % self._spatial_unit == 0:
+            return x
+        res = self._input_resolution
+        return F.interpolate(x, size=(res, res), mode="bilinear", align_corners=False)
+
+    def multi_scale_scales(self, expanded_scales: bool | None = None) -> list[int]:
+        """The native multi-scale training sizes for THIS model's configuration.
+
+        Reads ``resolution`` / ``patch_size`` / ``num_windows`` from the built
+        model config (``expanded_scales`` defaults to the wrapper train
+        config's setting) — hand the result to ``RandomMultiScaleResize`` so
+        the transform draws from exactly the sizes the native dataloader would.
+        """
+        if expanded_scales is None:
+            expanded_scales = bool(getattr(self._train_config, "expanded_scales", False))
+        mc = self._model_config
+        return compute_multi_scale_scales(
+            int(mc.resolution),
+            expanded_scales=bool(expanded_scales),
+            patch_size=int(getattr(mc, "patch_size", 16)),
+            num_windows=int(getattr(mc, "num_windows", 4)),
+        )
