@@ -102,7 +102,11 @@ class RFDETRTrainable(Node):
             "Connected components become DETR targets (single FO class). "
             "Required in TRAIN (denoising queries need targets).",
         ),
-        "context": PortSpec(dtype=Context, shape=()),
+        # The executor injects the Context as a call-site kwarg to every node
+        # (pipeline.forward(..., context=context)), never through a port, so this
+        # must be optional — otherwise graph pre-flight validation flags it as an
+        # unsatisfied required input (it is in neither the batch nor a connection).
+        "context": PortSpec(dtype=Context, shape=(), optional=True),
     }
 
     OUTPUT_SPECS = {
