@@ -88,27 +88,17 @@ def test_ema_weights_swapped_in_and_restored(tmp_path) -> None:
     assert torch.equal(node.model.weight, regular_w)  # restored afterwards
 
 
-def test_evaluate_perfect_predictions_score_map_one(tmp_path) -> None:
+try:  # the mAP backend MapEvalCallback defaults to is an optional extra
+    import faster_coco_eval  # noqa: F401
+
+    HAS_MAP_BACKEND = True
+except ImportError:  # pragma: no cover
+    HAS_MAP_BACKEND = False
+
+
+def _eval_rig(tmp_path, targets, postprocess):
     node = _Node()
     object.__setattr__(node, "_input_resolution", 100)
-    targets = [
-        {
-            "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.2, 0.3, 0.1, 0.1]]),
-            "labels": torch.tensor([0, 0]),
-        }
-    ]
-
-    def perfect_postprocess(raw, sizes):
-        assert raw == "RAW_OUTPUTS"
-        assert sizes.tolist() == [[100, 100]]
-        return [
-            {
-                "boxes": _cxcywh_norm_to_xyxy_abs(targets[0]["boxes"], 100),
-                "scores": torch.tensor([0.9, 0.8]),
-                "labels": targets[0]["labels"].clone(),
-            }
-        ]
-
     pipeline = SimpleNamespace(
         nodes=[node],
         forward=lambda batch, context: {
@@ -123,41 +113,93 @@ def test_evaluate_perfect_predictions_score_map_one(tmp_path) -> None:
         current_epoch=0,
         datamodule=SimpleNamespace(val_dataloader=lambda: [{"data": torch.zeros(1)}]),
     )
-    cb = MapEvalCallback(
-        node_name=node.name, output_dir=str(tmp_path), postprocess=perfect_postprocess
-    )
+    cb = MapEvalCallback(node_name=node.name, output_dir=str(tmp_path), postprocess=postprocess)
     cb.on_fit_start(trainer, pl_module)
-    assert cb._evaluate(trainer, pl_module) == pytest.approx(1.0)
+    return cb, trainer, pl_module
 
 
-def test_evaluate_wrong_boxes_score_below_one(tmp_path) -> None:
-    node = _Node()
-    object.__setattr__(node, "_input_resolution", 100)
-    targets = [{"boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]]), "labels": torch.tensor([0])}]
-
-    def offset_postprocess(raw, sizes):
-        boxes = _cxcywh_norm_to_xyxy_abs(targets[0]["boxes"], 100) + 15.0  # shifted
-        return [{"boxes": boxes, "scores": torch.tensor([0.9]), "labels": torch.tensor([0])}]
-
-    pipeline = SimpleNamespace(
-        nodes=[node],
-        forward=lambda batch, context: {
-            (node.name, "outputs"): None,
-            (node.name, "targets"): targets,
+def test_evaluate_plumbing_with_mocked_metric(tmp_path, monkeypatch) -> None:
+    # Cover _evaluate everywhere (no MAP backend needed): assert it feeds the
+    # postprocessed preds and the cxcywh->xyxy-converted GT to the metric, one
+    # update per val batch, and returns metric.compute()["map"].
+    targets = [
+        {
+            "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.2, 0.3, 0.1, 0.1]]),
+            "labels": torch.tensor([0, 0]),
         },
+    ]
+
+    def postprocess(raw, sizes):
+        assert raw == "RAW_OUTPUTS" and sizes.tolist() == [[100, 100]]
+        return [
+            {
+                "boxes": _cxcywh_norm_to_xyxy_abs(targets[0]["boxes"], 100),
+                "scores": torch.tensor([0.9, 0.8]),
+                "labels": targets[0]["labels"].clone(),
+            }
+        ]
+
+    captured = {"preds": [], "gts": [], "updates": 0}
+
+    class FakeMAP:
+        def __init__(self, iou_type, backend):
+            captured["iou_type"], captured["backend"] = iou_type, backend
+
+        def update(self, preds, gts):
+            captured["preds"] += preds
+            captured["gts"] += gts
+            captured["updates"] += 1
+
+        def compute(self):
+            return {"map": torch.tensor(0.4242)}
+
+    import torchmetrics.detection
+
+    monkeypatch.setattr(torchmetrics.detection, "MeanAveragePrecision", FakeMAP)
+
+    cb, trainer, pl_module = _eval_rig(tmp_path, targets, postprocess)
+    result = cb._evaluate(trainer, pl_module)
+    assert result == pytest.approx(0.4242)  # returns the metric's map
+    assert captured["updates"] == 1  # one val batch
+    assert captured["backend"] == "faster_coco_eval"  # node's default backend forwarded
+    # GT boxes were converted cxcywh(norm) -> xyxy(abs @ res 100)
+    assert torch.allclose(
+        captured["gts"][0]["boxes"], _cxcywh_norm_to_xyxy_abs(targets[0]["boxes"], 100)
     )
-    pl_module = SimpleNamespace(pipeline=pipeline)
-    trainer = SimpleNamespace(
-        callbacks=[],
-        sanity_checking=False,
-        current_epoch=0,
-        datamodule=SimpleNamespace(val_dataloader=lambda: [{"data": torch.zeros(1)}]),
+    assert torch.equal(captured["preds"][0]["scores"], torch.tensor([0.9, 0.8]))
+
+
+@pytest.mark.skipif(
+    not HAS_MAP_BACKEND, reason="needs a torchmetrics MAP backend (faster-coco-eval)"
+)
+def test_evaluate_real_backend_perfect_and_wrong(tmp_path) -> None:
+    # With the real backend present: perfect boxes -> mAP 1.0; shifted -> < 1.0.
+    targets = [{"boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]]), "labels": torch.tensor([0])}]
+    cb, tr, plm = _eval_rig(
+        tmp_path,
+        targets,
+        lambda raw, s: [
+            {
+                "boxes": _cxcywh_norm_to_xyxy_abs(targets[0]["boxes"], 100),
+                "scores": torch.tensor([0.9]),
+                "labels": torch.tensor([0]),
+            }
+        ],
     )
-    cb = MapEvalCallback(
-        node_name=node.name, output_dir=str(tmp_path), postprocess=offset_postprocess
+    assert cb._evaluate(tr, plm) == pytest.approx(1.0)
+
+    cb2, tr2, plm2 = _eval_rig(
+        tmp_path,
+        targets,
+        lambda raw, s: [
+            {
+                "boxes": _cxcywh_norm_to_xyxy_abs(targets[0]["boxes"], 100) + 15.0,
+                "scores": torch.tensor([0.9]),
+                "labels": torch.tensor([0]),
+            }
+        ],
     )
-    cb.on_fit_start(trainer, pl_module)
-    assert cb._evaluate(trainer, pl_module) < 1.0
+    assert cb2._evaluate(tr2, plm2) < 1.0
 
 
 def test_cxcywh_conversion() -> None:
