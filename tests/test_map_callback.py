@@ -165,3 +165,41 @@ def test_cxcywh_conversion() -> None:
     out = _cxcywh_norm_to_xyxy_abs(boxes, 100)
     assert torch.allclose(out, torch.tensor([[40.0, 30.0, 60.0, 70.0]]))
     assert _cxcywh_norm_to_xyxy_abs(torch.zeros(0, 4), 100).shape == (0, 4)
+
+
+def test_payload_is_self_describing_when_node_has_configs(tmp_path, monkeypatch) -> None:
+    # With model/train configs + variant on the node, checkpoints must carry
+    # model_name + a native-style flat args namespace (num_queries, group_detr,
+    # resolution, ...) so rfdetr's loaders can rebuild the architecture instead
+    # of falling back to a flat weight slice.
+    node = _Node()
+    object.__setattr__(
+        node,
+        "_model_config",
+        SimpleNamespace(num_queries=200, group_detr=13, resolution=624, patch_size=12),
+    )
+    object.__setattr__(node, "_train_config", SimpleNamespace(expanded_scales=True, lr=1e-4))
+    object.__setattr__(node, "variant", "medium")
+    object.__setattr__(node, "segmentation", True)
+
+    pipeline = SimpleNamespace(nodes=[node])
+    pl_module = SimpleNamespace(pipeline=pipeline)
+    trainer = SimpleNamespace(
+        callbacks=[],
+        sanity_checking=False,
+        current_epoch=3,
+        datamodule=SimpleNamespace(val_dataloader=lambda: []),
+    )
+    cb = MapEvalCallback(node_name=node.name, output_dir=str(tmp_path), postprocess=lambda r, s: r)
+    cb.on_fit_start(trainer, pl_module)
+    monkeypatch.setattr(cb, "_evaluate", lambda *a, **k: 0.7)
+    cb.on_validation_epoch_end(trainer, pl_module)
+
+    # args is a pickled namespace -> weights_only=False, exactly like native ckpts
+    payload = torch.load(tmp_path / "checkpoint_best_total.pth", weights_only=False)
+    assert payload["model_name"] == "RFDETRSegMedium"
+    assert payload["args"].num_queries == 200
+    assert payload["args"].group_detr == 13
+    assert payload["args"].resolution == 624
+    assert payload["args"].expanded_scales is True  # train config merged in
+    assert payload["stream"] == "regular" and payload["epoch"] == 3

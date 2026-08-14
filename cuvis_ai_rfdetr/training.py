@@ -248,8 +248,11 @@ class EmaCallback(pl.Callback):
             self._pending_state = state_dict
 
     def save(self, path: str) -> None:
-        """Write the EMA weights (``{"model": state_dict, "updates": int}``)."""
-        payload = {"model": self.ema_module.state_dict(), "updates": int(self.ema.updates)}
+        """Write the EMA weights (``{"model": state_dict, "updates": int}``, CPU tensors)."""
+        payload = {
+            "model": {k: v.detach().cpu() for k, v in self.ema_module.state_dict().items()},
+            "updates": int(self.ema.updates),
+        }
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         torch.save(payload, out)
@@ -412,9 +415,37 @@ class MapEvalCallback(pl.Callback):
 
     def _payload(self, stream: str, value: float, epoch: int) -> dict[str, Any]:
         model = self._node.model if stream == "regular" else self._ema.ema_module
-        return {
+        payload: dict[str, Any] = {
             "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
             "map": float(value),
             "epoch": int(epoch),
             "stream": stream,
         }
+        # Make the checkpoint self-describing, like rfdetr's native format: without
+        # `model_name`/`args`, rfdetr's loaders cannot recover the architecture
+        # (class, query structure, resolution) and fall back to a flat weight
+        # slice — silent scrambling for non-default configs. `args` is the flat
+        # model+train merge (the native trainer's args shape). Note: with `args`
+        # present the file must be loaded with `weights_only=False`, exactly like
+        # native rfdetr checkpoints.
+        node = self._node
+        if hasattr(node, "_model_config") and hasattr(node, "_train_config"):
+            from types import SimpleNamespace
+
+            def as_dict(cfg: Any) -> dict[str, Any]:
+                return dict(cfg.model_dump()) if hasattr(cfg, "model_dump") else dict(vars(cfg))
+
+            payload["args"] = SimpleNamespace(
+                **{**as_dict(node._model_config), **as_dict(node._train_config)}
+            )
+        if getattr(node, "variant", None) is not None:
+            from cuvis_ai_rfdetr.node.rfdetr_trainable import (
+                _DET_CLASS_NAMES,
+                _SEG_CLASS_NAMES,
+            )
+
+            table = _SEG_CLASS_NAMES if getattr(node, "segmentation", False) else _DET_CLASS_NAMES
+            name = table.get(str(node.variant), None)
+            if name:
+                payload["model_name"] = name
+        return payload
