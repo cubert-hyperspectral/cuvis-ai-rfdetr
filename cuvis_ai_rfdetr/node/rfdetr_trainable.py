@@ -133,6 +133,7 @@ class RFDETRTrainable(Node):
         segmentation: bool = False,
         resolution: int | None = None,
         num_channels: int = 3,
+        checkpoint_loader: str = "constructor",
         **kwargs: Any,
     ) -> None:
         variant_key = str(variant).lower()
@@ -151,6 +152,17 @@ class RFDETRTrainable(Node):
         num_channels = int(num_channels)
         if num_channels < 1:
             raise ValueError(f"RFDETRTrainable: num_channels must be >= 1, got {num_channels}.")
+        if checkpoint_loader not in ("constructor", "from_checkpoint"):
+            raise ValueError(
+                "RFDETRTrainable: checkpoint_loader must be 'constructor' or "
+                f"'from_checkpoint', got {checkpoint_loader!r}."
+            )
+        if checkpoint_loader == "from_checkpoint" and num_channels != 3:
+            raise ValueError(
+                "RFDETRTrainable: checkpoint_loader='from_checkpoint' supports only "
+                "num_channels=3 (rfdetr's loader has no channel-inflation path); "
+                "use checkpoint_loader='constructor' for >3-band composites."
+            )
 
         self.dataset_dir = str(dataset_dir)
         self.checkpoint_path = checkpoint_path
@@ -158,6 +170,7 @@ class RFDETRTrainable(Node):
         self.segmentation = bool(segmentation)
         self.resolution = resolution
         self.num_channels = num_channels
+        self.checkpoint_loader = checkpoint_loader
 
         name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
@@ -169,6 +182,7 @@ class RFDETRTrainable(Node):
             segmentation=self.segmentation,
             resolution=self.resolution,
             num_channels=self.num_channels,
+            checkpoint_loader=self.checkpoint_loader,
             **kwargs,
         )
 
@@ -181,15 +195,7 @@ class RFDETRTrainable(Node):
                 "construction time: pip install 'rfdetr[train]>=1.8,<2'"
             ) from exc
 
-        wrapper_cls = getattr(rfdetr, table[variant_key])
-        wrapper_kwargs: dict[str, Any] = {}
-        if self.checkpoint_path is not None:
-            wrapper_kwargs["pretrain_weights"] = str(self.checkpoint_path)
-        if self.resolution is not None:
-            wrapper_kwargs["resolution"] = int(self.resolution)
-        if self.num_channels != 3:
-            wrapper_kwargs["num_channels"] = self.num_channels
-        wrapper = wrapper_cls(**wrapper_kwargs)
+        wrapper = self._build_wrapper(rfdetr, table)
         model_config = wrapper.model_config
         if int(getattr(model_config, "num_channels", 3)) != self.num_channels:
             raise RuntimeError(
@@ -269,6 +275,54 @@ class RFDETRTrainable(Node):
         for p in self.model.parameters():
             p.requires_grad_(False)
         super().freeze()
+
+    def _build_wrapper(self, rfdetr: Any, table: dict[str, str]) -> Any:
+        """Build the RF-DETR wrapper via the configured checkpoint loader.
+
+        ``"constructor"`` (default, unchanged behavior): the variant class with
+        ``pretrain_weights=checkpoint_path``. Its generic weight loader falls
+        back to a flat slice when a checkpoint lacks ``args.num_queries`` /
+        ``args.group_detr`` — with ``group_detr > 1`` that can scramble the
+        per-group query structure of a fine-tuned checkpoint.
+
+        ``"from_checkpoint"``: delegate to ``rfdetr.RFDETR.from_checkpoint`` —
+        the same loader-faithful path the inference nodes use. The wrapper class
+        and configuration (including the query structure) come from the
+        checkpoint itself, so fine-tuned weights load without the flat-slice
+        fallback; ``variant`` / ``segmentation`` must match the checkpoint and
+        are validated against the resolved class.
+        """
+        class_name = table[self.variant]
+        if self.checkpoint_path is not None and self.checkpoint_loader == "from_checkpoint":
+            loader = getattr(rfdetr, "RFDETR", None)
+            if loader is None or not hasattr(loader, "from_checkpoint"):
+                raise RuntimeError(
+                    "RFDETRTrainable: checkpoint_loader='from_checkpoint' requires "
+                    "rfdetr>=1.8 (rfdetr.RFDETR.from_checkpoint not found)."
+                )
+            loader_kwargs: dict[str, Any] = {}
+            if self.resolution is not None:
+                loader_kwargs["resolution"] = int(self.resolution)
+            wrapper = loader.from_checkpoint(str(self.checkpoint_path), **loader_kwargs)
+            loaded = type(wrapper).__name__
+            if loaded != class_name:
+                raise RuntimeError(
+                    f"RFDETRTrainable: checkpoint resolved to {loaded}, but "
+                    f"variant={self.variant!r} (segmentation={self.segmentation}) expects "
+                    f"{class_name}. Set variant/segmentation to match the checkpoint or "
+                    "use checkpoint_loader='constructor'."
+                )
+            return wrapper
+
+        wrapper_cls = getattr(rfdetr, class_name)
+        wrapper_kwargs: dict[str, Any] = {}
+        if self.checkpoint_path is not None:
+            wrapper_kwargs["pretrain_weights"] = str(self.checkpoint_path)
+        if self.resolution is not None:
+            wrapper_kwargs["resolution"] = int(self.resolution)
+        if self.num_channels != 3:
+            wrapper_kwargs["num_channels"] = self.num_channels
+        return wrapper_cls(**wrapper_kwargs)
 
     def get_param_groups(
         self,
