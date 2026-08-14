@@ -245,3 +245,146 @@ def test_payload_is_self_describing_when_node_has_configs(tmp_path, monkeypatch)
     assert payload["args"].resolution == 624
     assert payload["args"].expanded_scales is True  # train config merged in
     assert payload["stream"] == "regular" and payload["epoch"] == 3
+
+
+# ------------------------------------------------------- MapEval edge cases
+def test_without_ema_callback_only_regular_stream(tmp_path, monkeypatch) -> None:
+    node = _Node()
+    pipeline = SimpleNamespace(nodes=[node])
+    pl_module = SimpleNamespace(pipeline=pipeline)
+    trainer = SimpleNamespace(
+        callbacks=[],  # no EmaCallback attached
+        sanity_checking=False,
+        current_epoch=0,
+        datamodule=SimpleNamespace(val_dataloader=lambda: []),
+    )
+    cb = MapEvalCallback(node_name=node.name, output_dir=str(tmp_path), postprocess=lambda r, s: r)
+    cb.on_fit_start(trainer, pl_module)
+    monkeypatch.setattr(cb, "_evaluate", lambda *a, **k: 0.6)
+    cb.on_validation_epoch_end(trainer, pl_module)
+
+    assert [h["stream"] for h in cb.history] == ["regular"]  # no ema evaluation
+    assert cb.best["total"]["stream"] == "regular"
+    assert (tmp_path / "checkpoint_best_regular.pth").exists()
+    assert not (tmp_path / "checkpoint_best_ema.pth").exists()
+
+
+def test_equal_map_keeps_first_epoch(tmp_path, monkeypatch) -> None:
+    # strict-max: a later EQUAL value must not overwrite the earlier checkpoint
+    cb, trainer, pl_module, _ = _rig(tmp_path)
+    script = iter([0.5, 0.1, 0.5, 0.1])  # regular repeats the same best at epoch 1
+    monkeypatch.setattr(cb, "_evaluate", lambda *a, **k: next(script))
+    for epoch in range(2):
+        trainer.current_epoch = epoch
+        cb.on_validation_epoch_end(trainer, pl_module)
+    assert cb.best["regular"] == {"map": 0.5, "epoch": 0}  # first epoch retained
+    assert cb.best["total"]["epoch"] == 0
+
+
+def test_evaluate_counts_one_update_per_val_batch(tmp_path, monkeypatch) -> None:
+    targets = [{"boxes": torch.zeros(0, 4), "labels": torch.zeros(0, dtype=torch.long)}]
+    node = _Node()
+    object.__setattr__(node, "_input_resolution", 50)
+    pipeline = SimpleNamespace(
+        nodes=[node],
+        forward=lambda batch, context: {
+            (node.name, "outputs"): None,
+            (node.name, "targets"): targets,
+        },
+    )
+    pl_module = SimpleNamespace(pipeline=pipeline)
+    trainer = SimpleNamespace(
+        callbacks=[],
+        sanity_checking=False,
+        current_epoch=0,
+        datamodule=SimpleNamespace(
+            val_dataloader=lambda: [
+                {"d": torch.zeros(1)},
+                {"d": torch.zeros(1)},
+                {"d": torch.zeros(1)},
+            ]
+        ),
+    )
+
+    calls = {"updates": 0}
+
+    class FakeMAP:
+        def __init__(self, iou_type, backend): ...
+
+        def update(self, preds, gts):
+            calls["updates"] += 1
+
+        def compute(self):
+            return {"map": torch.tensor(0.0)}
+
+    import torchmetrics.detection
+
+    monkeypatch.setattr(torchmetrics.detection, "MeanAveragePrecision", FakeMAP)
+    cb = MapEvalCallback(
+        node_name=node.name,
+        output_dir=str(tmp_path),
+        postprocess=lambda r, s: [
+            {
+                "boxes": torch.zeros(0, 4),
+                "scores": torch.zeros(0),
+                "labels": torch.zeros(0, dtype=torch.long),
+            }
+        ],
+    )
+    cb.on_fit_start(trainer, pl_module)
+    cb._evaluate(trainer, pl_module)
+    assert calls["updates"] == 3  # one metric update per val batch
+
+
+def test_bare_node_payload_stays_weights_only_loadable(tmp_path, monkeypatch) -> None:
+    # nodes without configs (back-compat) -> no args/model_name, still weights_only=True
+    cb, trainer, pl_module, _ = _rig(tmp_path)  # _Node has no configs/variant
+    monkeypatch.setattr(cb, "_evaluate", lambda *a, **k: 0.5)
+    cb.on_validation_epoch_end(trainer, pl_module)
+    payload = torch.load(tmp_path / "checkpoint_best_total.pth", weights_only=True)
+    assert "args" not in payload and "model_name" not in payload
+
+
+def test_detection_variant_model_name(tmp_path, monkeypatch) -> None:
+    node = _Node()
+    object.__setattr__(node, "_model_config", SimpleNamespace(num_queries=300))
+    object.__setattr__(node, "_train_config", SimpleNamespace(lr=1e-4))
+    object.__setattr__(node, "variant", "large")
+    object.__setattr__(node, "segmentation", False)  # detection tier
+    pipeline = SimpleNamespace(nodes=[node])
+    pl_module = SimpleNamespace(pipeline=pipeline)
+    trainer = SimpleNamespace(
+        callbacks=[],
+        sanity_checking=False,
+        current_epoch=0,
+        datamodule=SimpleNamespace(val_dataloader=lambda: []),
+    )
+    cb = MapEvalCallback(node_name=node.name, output_dir=str(tmp_path), postprocess=lambda r, s: r)
+    cb.on_fit_start(trainer, pl_module)
+    monkeypatch.setattr(cb, "_evaluate", lambda *a, **k: 0.3)
+    cb.on_validation_epoch_end(trainer, pl_module)
+    payload = torch.load(tmp_path / "checkpoint_best_total.pth", weights_only=False)
+    assert payload["model_name"] == "RFDETRLarge"
+
+
+def test_unknown_variant_omits_model_name(tmp_path, monkeypatch) -> None:
+    node = _Node()
+    object.__setattr__(node, "_model_config", SimpleNamespace(num_queries=300))
+    object.__setattr__(node, "_train_config", SimpleNamespace(lr=1e-4))
+    object.__setattr__(node, "variant", "gigantic")  # not in any table
+    object.__setattr__(node, "segmentation", True)
+    pipeline = SimpleNamespace(nodes=[node])
+    pl_module = SimpleNamespace(pipeline=pipeline)
+    trainer = SimpleNamespace(
+        callbacks=[],
+        sanity_checking=False,
+        current_epoch=0,
+        datamodule=SimpleNamespace(val_dataloader=lambda: []),
+    )
+    cb = MapEvalCallback(node_name=node.name, output_dir=str(tmp_path), postprocess=lambda r, s: r)
+    cb.on_fit_start(trainer, pl_module)
+    monkeypatch.setattr(cb, "_evaluate", lambda *a, **k: 0.3)
+    cb.on_validation_epoch_end(trainer, pl_module)
+    payload = torch.load(tmp_path / "checkpoint_best_total.pth", weights_only=False)
+    assert "model_name" not in payload
+    assert payload["args"].num_queries == 300  # args still attached

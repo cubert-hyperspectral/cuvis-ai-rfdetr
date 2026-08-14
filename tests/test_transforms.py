@@ -181,3 +181,131 @@ def test_multi_scale_scales_reads_model_config() -> None:
     assert node.multi_scale_scales(expanded_scales=False) == compute_multi_scale_scales(
         624, False, 12, 2
     )
+
+
+# ----------------------------------------------------- scale-formula edge cases
+def test_scales_floor_behavior_and_ordering() -> None:
+    # resolution floors to the unit: 625 and 624 give identical sets
+    assert compute_multi_scale_scales(625, True, 12, 2) == compute_multi_scale_scales(
+        624, True, 12, 2
+    )
+    scales = compute_multi_scale_scales(624, True, 12, 2)
+    assert scales == sorted(set(scales))  # strictly increasing, no duplicates
+
+
+def test_scales_non_expanded_is_subset_of_expanded() -> None:
+    exp = set(compute_multi_scale_scales(624, True, 12, 2))
+    base = set(compute_multi_scale_scales(624, False, 12, 2))
+    assert base <= exp
+
+
+def test_scales_resolution_below_unit_still_nonempty() -> None:
+    # base floor is 0; only offsets producing >= 2 units survive
+    scales = compute_multi_scale_scales(20, True, 12, 2)  # unit 24, res < unit
+    assert scales and min(scales) >= 48 and all(s % 24 == 0 for s in scales)
+
+
+# ----------------------------------------------------- transform edge cases
+@needs_augment
+def test_mask_none_returns_none() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(scales=[96])
+    out_cube, out_mask = t(torch.rand(1, 40, 40, 3), None, torch.Generator().manual_seed(0))
+    assert out_mask is None
+    assert out_cube.shape == (1, 96, 96, 3)
+
+
+@needs_augment
+def test_bool_mask_supported_and_binary_preserved() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(scales=[64])
+    mask = torch.zeros(1, 32, 32, dtype=torch.bool)
+    mask[0, 8:16, 8:16] = True
+    _, out_mask = t(torch.rand(1, 32, 32, 2), mask, torch.Generator().manual_seed(0))
+    assert out_mask.dtype == torch.bool
+    assert out_mask.any() and not out_mask.all()  # region survives nearest resize
+
+
+@needs_augment
+def test_upscale_and_downscale_both_work() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    up = RandomMultiScaleResize(scales=[128])(  # 50 -> 128 (upscale)
+        torch.rand(1, 50, 50, 3), None, torch.Generator().manual_seed(0)
+    )[0]
+    down = RandomMultiScaleResize(scales=[24])(  # 50 -> 24 (downscale)
+        torch.rand(1, 50, 50, 3), None, torch.Generator().manual_seed(0)
+    )[0]
+    assert up.shape[1:3] == (128, 128) and down.shape[1:3] == (24, 24)
+
+
+@needs_augment
+def test_wavelengths_argument_is_ignored() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(scales=[48])
+    out, _ = t(torch.rand(1, 30, 30, 4), None, torch.Generator().manual_seed(0), [500.0] * 4)
+    assert out.shape == (1, 48, 48, 4)
+
+
+@needs_augment
+def test_mask_shape_mismatch_raises() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(scales=[48])
+    with pytest.raises(ValueError, match="spatial shapes must match"):
+        t(
+            torch.rand(1, 30, 30, 2),
+            torch.zeros(1, 30, 29, dtype=torch.int32),
+            torch.Generator().manual_seed(0),
+        )
+
+
+@needs_augment
+def test_single_scale_always_that_scale() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    t = RandomMultiScaleResize(scales=[72])
+    for seed in (0, 1, 2):
+        out, _ = t(torch.rand(1, 30, 30, 1), None, torch.Generator().manual_seed(seed))
+        assert out.shape[1:3] == (72, 72)
+
+
+@needs_augment
+def test_invalid_scale_values_raise() -> None:
+    from cuvis_ai_rfdetr.transforms import RandomMultiScaleResize
+
+    with pytest.raises(ValueError, match="invalid scales"):
+        RandomMultiScaleResize(scales=[])
+    with pytest.raises(ValueError, match="invalid scales"):
+        RandomMultiScaleResize(scales=[96, 0])
+
+
+# --------------------------------------------- stage-aware resize edge cases
+def test_resize_for_stage_val_and_test_always_fixed() -> None:
+    from cuvis_ai_schemas.enums import ExecutionStage
+
+    node = _bare_trainable()
+    x = torch.rand(1, 3, 456, 456)  # divisible by 24
+    for stage in (ExecutionStage.VAL, ExecutionStage.TEST):
+        assert node._resize_for_stage(x, stage).shape[-2:] == (432, 432)
+
+
+def test_resize_for_stage_train_nonsquare_divisible_resizes() -> None:
+    from cuvis_ai_schemas.enums import ExecutionStage
+
+    node = _bare_trainable()
+    x = torch.rand(1, 3, 480, 504)  # both divisible by 24 but NOT square
+    assert node._resize_for_stage(x, ExecutionStage.TRAIN).shape[-2:] == (432, 432)
+
+
+def test_every_native_scale_passes_through_at_train() -> None:
+    # contract glue: every size the transform can emit is passthrough-compatible
+    from cuvis_ai_schemas.enums import ExecutionStage
+
+    node = _bare_trainable()
+    for s in node.multi_scale_scales():
+        x = torch.rand(1, 3, s, s)
+        assert node._resize_for_stage(x, ExecutionStage.TRAIN) is x, f"scale {s} resized"

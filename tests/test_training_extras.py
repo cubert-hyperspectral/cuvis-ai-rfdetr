@@ -410,3 +410,190 @@ def test_trainable_from_checkpoint_forwards_kwargs_and_validates_class(monkeypat
         )
     assert captured["path"] == "champion.pth"
     assert captured["kwargs"] == {"resolution": 624}  # loader kwargs forwarded
+
+
+# ------------------------------------------------------- EmaCallback edge cases
+def test_ema_module_property_raises_before_fit() -> None:
+    with pytest.raises(RuntimeError, match="not initialized"):
+        _ = EmaCallback().ema_module
+
+
+def test_empty_load_state_dict_is_noop_and_fresh_fit_works() -> None:
+    node = _Node()
+    trainer, pl_module = _fake_pl(node)
+    cb = EmaCallback(ema_cls=_StubEma)
+    cb.load_state_dict({})  # e.g. restored from a checkpoint saved before any fit
+    cb.on_fit_start(trainer, pl_module)
+    assert torch.equal(cb.ema_module.weight, node.model.weight)  # fresh copy, no restore
+
+
+def test_state_dict_before_fit_passes_pending_through() -> None:
+    cb = EmaCallback(ema_cls=_StubEma)
+    assert cb.state_dict() == {}  # nothing yet
+    pending = {"ema_state": {}, "updates": 7, "batches_seen": 3}
+    cb.load_state_dict(pending)
+    assert cb.state_dict() == pending  # survives a save-before-fit round trip
+
+
+def test_interval_larger_than_run_saves_initial_copy(tmp_path) -> None:
+    node = _Node()
+    trainer, pl_module = _fake_pl(node)
+    cb = EmaCallback(update_interval=100, ema_cls=_StubEma, save_path=str(tmp_path / "e.pth"))
+    cb.on_fit_start(trainer, pl_module)
+    initial = cb.ema_module.weight.detach().clone()
+    with torch.no_grad():
+        node.model.weight += 1.0
+    for i in range(5):  # fewer batches than the interval -> EMA never updates
+        cb.on_train_batch_end(trainer, pl_module, None, None, i)
+    cb.on_fit_end(trainer, pl_module)
+    payload = torch.load(tmp_path / "e.pth", weights_only=True)
+    assert torch.equal(payload["model"]["weight"], initial)
+    assert payload["updates"] == 1  # stub starts at 1, no update happened
+
+
+def test_ema_save_writes_cpu_tensors(tmp_path) -> None:
+    node = _Node()
+    trainer, pl_module = _fake_pl(node)
+    cb = EmaCallback(ema_cls=_StubEma, save_path=str(tmp_path / "e.pth"))
+    cb.on_fit_start(trainer, pl_module)
+    cb.on_fit_end(trainer, pl_module)
+    payload = torch.load(tmp_path / "e.pth", weights_only=True)
+    assert all(v.device.type == "cpu" for v in payload["model"].values())
+
+
+# --------------------------------------------------- get_param_groups edge cases
+@needs_train_stack
+def test_get_param_groups_no_overrides_uses_config_values(monkeypatch) -> None:
+    from cuvis_ai_rfdetr.node import rfdetr_trainable as mod
+
+    node = mod.RFDETRTrainable.__new__(mod.RFDETRTrainable)
+    object.__setattr__(node, "_train_config", SimpleNamespace(lr=3e-4, lr_encoder=9e-4))
+    object.__setattr__(node, "_model_config", SimpleNamespace(out_feature_indexes=[1]))
+    object.__setattr__(node, "model", torch.nn.Linear(2, 2))
+
+    captured = {}
+    import rfdetr.training.param_groups as pg
+
+    monkeypatch.setattr(pg, "get_param_dict", lambda cfg, m: captured.update(cfg=cfg) or [])
+    mod.RFDETRTrainable.get_param_groups(node, lr=None)
+    assert captured["cfg"].lr == 3e-4  # config value passes through untouched
+    assert captured["cfg"].lr_encoder == 9e-4
+
+
+@needs_train_stack
+def test_get_param_groups_train_config_wins_key_collisions(monkeypatch) -> None:
+    from cuvis_ai_rfdetr.node import rfdetr_trainable as mod
+
+    node = mod.RFDETRTrainable.__new__(mod.RFDETRTrainable)
+    # both configs define `resolution`: the train config must win the flat merge
+    object.__setattr__(node, "_model_config", SimpleNamespace(resolution=432, patch_size=12))
+    object.__setattr__(node, "_train_config", SimpleNamespace(resolution=624, lr=1e-4))
+    object.__setattr__(node, "model", torch.nn.Linear(2, 2))
+
+    captured = {}
+    import rfdetr.training.param_groups as pg
+
+    monkeypatch.setattr(pg, "get_param_dict", lambda cfg, m: captured.update(cfg=cfg) or [])
+    mod.RFDETRTrainable.get_param_groups(node)
+    assert captured["cfg"].resolution == 624  # train config overrode model config
+    assert captured["cfg"].patch_size == 12  # model-only field survives
+
+
+@needs_train_stack
+def test_get_param_groups_model_dump_branch(monkeypatch) -> None:
+    from cuvis_ai_rfdetr.node import rfdetr_trainable as mod
+
+    class PydanticLike:
+        def __init__(self, **kw):
+            self._kw = kw
+
+        def model_dump(self):
+            return dict(self._kw)
+
+    node = mod.RFDETRTrainable.__new__(mod.RFDETRTrainable)
+    object.__setattr__(node, "_model_config", PydanticLike(num_queries=200))
+    object.__setattr__(node, "_train_config", PydanticLike(lr=1e-4))
+    object.__setattr__(node, "model", torch.nn.Linear(2, 2))
+
+    captured = {}
+    import rfdetr.training.param_groups as pg
+
+    monkeypatch.setattr(pg, "get_param_dict", lambda cfg, m: captured.update(cfg=cfg) or [])
+    mod.RFDETRTrainable.get_param_groups(node)
+    assert captured["cfg"].num_queries == 200 and captured["cfg"].lr == 1e-4
+
+
+# ------------------------------------------- RFDETRGradientTrainer edge cases
+def _bare_grouped_trainer(pipeline, scheduler_config=None):
+    from cuvis_ai_core.training.config import OptimizerConfig, TrainingConfig
+
+    from cuvis_ai_rfdetr.training import RFDETRGradientTrainer
+
+    trainer = RFDETRGradientTrainer.__new__(RFDETRGradientTrainer)
+    cfg = TrainingConfig(optimizer=OptimizerConfig(name="adamw", lr=1e-4))
+    for attr, value in {
+        "pipeline": pipeline,
+        "optimizer_config": cfg.optimizer,
+        "scheduler_config": scheduler_config,
+        "training_config": cfg,
+        "node_name": "RFDETR",
+        "_group_overrides": {
+            "lr_encoder": None,
+            "lr_vit_layer_decay": None,
+            "lr_component_decay": None,
+        },
+    }.items():
+        object.__setattr__(trainer, attr, value)
+    return trainer
+
+
+def test_trainer_no_leftovers_single_group() -> None:
+    p = torch.nn.Parameter(torch.zeros(2))
+
+    class _Stub:
+        name = "RFDETR"
+
+        @staticmethod
+        def get_param_groups(lr, **_):
+            return [{"params": [p], "lr": lr}]
+
+    pipeline = SimpleNamespace(nodes=[_Stub()], parameters=lambda: iter([p]))
+    optimizer = _bare_grouped_trainer(pipeline).configure_optimizers()
+    assert len(optimizer.param_groups) == 1  # everything grouped -> no leftover group
+
+
+def test_trainer_handles_scalar_params_entry() -> None:
+    # torch accepts {"params": <single tensor>}; the leftover-dedup must too
+    p1 = torch.nn.Parameter(torch.zeros(2))
+    p2 = torch.nn.Parameter(torch.zeros(3))
+
+    class _Stub:
+        name = "RFDETR"
+
+        @staticmethod
+        def get_param_groups(lr, **_):
+            return [{"params": p1, "lr": lr * 0.5}]  # scalar, not a list
+
+    pipeline = SimpleNamespace(nodes=[_Stub()], parameters=lambda: iter([p1, p2]))
+    optimizer = _bare_grouped_trainer(pipeline).configure_optimizers()
+    assert len(optimizer.param_groups) == 2
+    leftover = optimizer.param_groups[1]["params"]
+    assert leftover == [p2]  # p1 correctly recognized as already grouped
+
+
+def test_trainer_scheduler_path_returns_lightning_dict() -> None:
+    from cuvis_ai_schemas.training.scheduler import SchedulerConfig
+
+    p = torch.nn.Parameter(torch.zeros(2))
+
+    class _Stub:
+        name = "RFDETR"
+
+        @staticmethod
+        def get_param_groups(lr, **_):
+            return [{"params": [p], "lr": lr}]
+
+    pipeline = SimpleNamespace(nodes=[_Stub()], parameters=lambda: iter([p]))
+    trainer = _bare_grouped_trainer(pipeline, SchedulerConfig(name="step", step_size=100))
+    out = trainer.configure_optimizers()
+    assert isinstance(out, dict) and "optimizer" in out and "lr_scheduler" in out
