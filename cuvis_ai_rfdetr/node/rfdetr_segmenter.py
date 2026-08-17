@@ -52,6 +52,19 @@ class RFDETRSegmenter(Node):
     In ``"tiled"`` mode each full-width row-strip is segmented independently;
     strip mask-scores are pasted back at their row offset (pixelwise max) and
     boxes are NMS-merged, mirroring the tiled evaluation protocol.
+
+    .. note::
+       **A pipeline ``.pt`` is not self-contained for this node.** The model is
+       built lazily and its weights are loaded from ``checkpoint_path`` (via
+       ``rfdetr.RFDETR.from_checkpoint``, which reconstructs the architecture
+       from the args stored in the rfdetr checkpoint — the robust path that
+       avoids flat-slice tensor mismatches). Consequently the weights are **not**
+       serialized into a cuvis-ai pipeline ``.pt`` by ``save_to_file``: a saved
+       pipeline containing this node still requires ``checkpoint_path`` to
+       resolve at load time (keep the checkpoint alongside the pipeline).
+       Embedding the weights *together with their architecture args* into the
+       pipeline state, so the ``.pt`` is standalone, is a known future
+       enhancement.
     """
 
     _category = NodeCategory.MODEL

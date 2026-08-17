@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+- Documented that the RF-DETR nodes (`RFDETRSegmenter` / `RFDETRDetector`) build their model lazily
+  and load weights from `checkpoint_path` (via `rfdetr.RFDETR.from_checkpoint`), so the weights are
+  **not** serialized into a cuvis-ai pipeline `.pt` by `save_to_file` — a saved pipeline containing an
+  RF-DETR node is not self-contained and `checkpoint_path` must resolve at load time. Embedding the
+  weights together with their architecture args so the `.pt` is standalone is a known future
+  enhancement (see the `RFDETRSegmenter` docstring).
+
 ## [0.4.0] - 2026-08-14
 
 ### Added
