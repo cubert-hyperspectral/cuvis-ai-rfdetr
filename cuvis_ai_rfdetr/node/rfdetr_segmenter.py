@@ -75,6 +75,19 @@ class RFDETRSegmenter(Node):
     default (``fast_paste``, bit-identical to the per-instance paste);
     ``precision``, ``jit_trace``, ``gpu_input`` and the TensorRT ``backend`` are
     opt-in (see ``__init__``).
+
+    .. note::
+       **A pipeline ``.pt`` is not self-contained for this node.** The model is
+       built lazily and its weights are loaded from ``checkpoint_path`` (via
+       ``rfdetr.RFDETR.from_checkpoint``, which reconstructs the architecture
+       from the args stored in the rfdetr checkpoint — the robust path that
+       avoids flat-slice tensor mismatches). Consequently the weights are **not**
+       serialized into a cuvis-ai pipeline ``.pt`` by ``save_to_file``: a saved
+       pipeline containing this node still requires ``checkpoint_path`` to
+       resolve at load time (keep the checkpoint alongside the pipeline).
+       Embedding the weights *together with their architecture args* into the
+       pipeline state, so the ``.pt`` is standalone, is a known future
+       enhancement.
     """
 
     _category = NodeCategory.MODEL
