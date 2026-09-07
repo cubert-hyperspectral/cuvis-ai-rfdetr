@@ -12,6 +12,7 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from torch import Tensor
 
+from cuvis_ai_rfdetr._compat import base_kwargs
 from cuvis_ai_rfdetr.functional import resolve_band_indices
 
 
@@ -110,10 +111,8 @@ class PercentileComposite(Node):
         self.p_low = p_low
         self.p_high = p_high
 
-        name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
-            name=name,
-            execution_stages=execution_stages,
+            **base_kwargs(kwargs),
             bands_nm=self.bands_nm,
             p_low=self.p_low,
             p_high=self.p_high,

@@ -14,6 +14,7 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from torch import Tensor
 
+from cuvis_ai_rfdetr._compat import base_kwargs
 from cuvis_ai_rfdetr.functional import compute_multi_scale_scales, targets_from_mask
 
 #: Detection tier (Apache-2.0 sizes only — XL/2XL detection is platform-licensed).
@@ -172,10 +173,8 @@ class RFDETRTrainable(Node):
         self.num_channels = num_channels
         self.checkpoint_loader = checkpoint_loader
 
-        name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
-            name=name,
-            execution_stages=execution_stages,
+            **base_kwargs(kwargs),
             dataset_dir=self.dataset_dir,
             checkpoint_path=self.checkpoint_path,
             variant=self.variant,

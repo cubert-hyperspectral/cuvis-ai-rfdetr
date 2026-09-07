@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+- Compatible with cuvis-ai-core >= 0.15, where execution stages became class-level and
+  `Node.consume_base_kwargs` / the `execution_stages=` constructor kwarg were removed (a node
+  built on such a core previously raised `AttributeError: type object 'Node' has no attribute
+  'consume_base_kwargs'` at construction). The nodes now route their base kwargs through
+  `cuvis_ai_rfdetr._compat.base_kwargs`, which keeps the pre-0.15 behaviour on older cores
+  (per-instance stage override read from the yaml) and passes only `name` on newer ones, where a
+  stray `execution_stages` in the yaml hparams is rejected the way core itself rejects it.
+  `RFDETRCriterionLoss` additionally declares its train/val/test stages as class-level
+  `EXECUTION_STAGES` for the new mechanism (the constructor still fixes them on old cores).
+
 ## [0.4.0] - 2026-08-14
 
 ### Added
