@@ -226,4 +226,9 @@ def test_manifest_lists_all_nodes() -> None:
         "RFDETRTrainable",
         "RFDETRCriterionLoss",
         "PercentileComposite",
+        "ScalarMinMaxBandSlice",
+        "ScoreIntersection",
+        "ScoreFusion",
+        "FixedPCAProjection",
+        "CarlSegmenter",
     }

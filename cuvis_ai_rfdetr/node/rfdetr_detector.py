@@ -12,6 +12,7 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from torch import Tensor
 
+from cuvis_ai_rfdetr._compat import base_kwargs
 from cuvis_ai_rfdetr.functional import (
     jpeg_roundtrip as _jpeg_roundtrip,
 )
@@ -261,10 +262,8 @@ class RFDETRDetector(Node):
         self.top_frac = top_frac
         self.checkpoint_loader = checkpoint_loader
 
-        name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
-            name=name,
-            execution_stages=execution_stages,
+            **base_kwargs(kwargs),
             checkpoint_path=self.checkpoint_path,
             variant=self.variant,
             threshold=self.threshold,

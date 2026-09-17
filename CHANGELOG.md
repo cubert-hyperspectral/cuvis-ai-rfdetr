@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+### Added
+- `RFDETRTrainable` gains `multiclass_targets` (default False): `targets_from_mask` builds per-class DETR targets
+  (label = mask class id - 1) instead of collapsing all foreground to one class — needed to train multi-class (e.g.
+  shell/fo/fake) models in-pipeline.
+- `FixedPCAProjection` node — cuvis-ai's `TrainablePCA` with a frozen, file-loaded projection (mean/components/
+  1-99% range from an `.npz` hparam) + fixed unit scaling and [0,1] clamp, so a downstream model always sees the exact
+  projection it was trained on (the stateless `PCA` node refits per frame - unusable in front of a trained model).
+  Reproduces the exporter's full input recipe: an `input_global_minmax` step (on by default) min-maxes each cube
+  globally to [0,1] before projecting, so the fixed projection is invariant to the caller's absolute reflectance scale
+  (cuvis.next's `CU3SDataNode` delivers raw-scale reflectance, not [0,1], which otherwise collapses the projection —
+  everything clamps to 1 and the mask goes empty). The min-max is global (one min/max over all H*W*C), matching the
+  export; per-channel scaling (`MinMaxNormalizer`) does not reproduce it. Exposes only the `projected` output port (the
+  parent's `components`/`explained_variance_ratio` ports are dropped — non-image ports break cuvis.next's per-output
+  display/mask handling).
+- `ScoreFusion` node — combine two score maps by `min`/`max`/`mean`/`gmean`/`wmean` (generalizes `ScoreIntersection`).
+  Soft fusion of RF-DETR (RGB shell) with CARL (61-band) at `gmean`/`mean` beats the `min` ensemble on the walnut set
+  (live recall 0.850 -> 0.90-0.92, 18-Aug IoU 0.947 -> 0.97; kernel FP stays ~45x below the single RGB model).
+- `ScalarMinMaxBandSlice` (`cuvis_ai_rfdetr.node.scalar_minmax_bandslice`): cube -> 3-band false-colour
+  composite using ONE scalar min-max over the whole cube (all bands together, so relative band
+  intensities are preserved) followed by nearest-band selection (`argmin |wavelength - nm|`), output
+  float32 in [0, 1]. This is the exact input recipe the walnut RF-DETR checkpoints were trained on;
+  `PercentileComposite` (per-band percentile stretch) and cuvis-ai's `FixedWavelengthSelector`
+  (per-band per-frame / running normalisation) do not reproduce it. Verified byte-exact against the
+  training exporter. Temporary home — candidate for upstreaming to cuvis-ai's channel selectors.
+- `ScoreIntersection` (`cuvis_ai_rfdetr.node.score_intersection`): elementwise minimum of two
+  `[B, H, W, 1]` score maps — the soft AND of two segmenters (thresholding the output at t is exactly
+  "both >= t"). Enables two-model ensembles (e.g. RGB ∩ 870-nm RF-DETR) inside one pipeline; torch-native,
+  stateless. Temporary home — candidate for a generic mask/score logic node in cuvis-ai.
+- `CarlSegmenter` (`cuvis_ai_rfdetr.node.carl_segmenter`): the CARL (IMSY-DKFZ) 61-band ViT-Adapter/UperNet
+  segmenter as a node — per-cube min-max + z-score + resize preprocessing (the training recipe), lazy import of the
+  CARL repo from `carl_repo`, softmax score map of one class + argmax labels; preprocessing runs on the model
+  device and the forward uses bf16 autocast by default (`precision` hparam: bf16 | fp16 | fp32) — 1.6x faster
+  than fp32 with identical masks; `band_step` (every k-th band + its wavelengths; k=2 is ~1.45x faster at 0.999
+  agreement) and opt-in `compile` + `compile_cache_dir` (torch.compile/inductor, ~1.6x, bit-identical; needs triton; warm cache restarts in ~30 s). Temporary home —
+  belongs in a `cuvis-ai-carl` plugin.
+
+### Fixed
+- Compatible with cuvis-ai-core >= 0.15, where execution stages became class-level and
+  `Node.consume_base_kwargs` / the `execution_stages=` constructor kwarg were removed: the nodes
+  now forward base kwargs through `cuvis_ai_rfdetr._compat.base_kwargs`, which keeps the
+  pre-0.15 behaviour on older cores (per-instance stage override from the yaml) and passes only
+  `name` on newer ones. `RFDETRCriterionLoss` declares its `{train, val, test}` stages as
+  `EXECUTION_STAGES` for the new mechanism (the constructor still fixes them on old cores).
+
 ## [0.4.0] - 2026-08-14
 
 ### Added

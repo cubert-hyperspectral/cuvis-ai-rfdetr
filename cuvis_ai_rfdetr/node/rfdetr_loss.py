@@ -9,6 +9,7 @@ from cuvis_ai_core.node.node import Node
 from cuvis_ai_schemas.enums import ExecutionStage, NodeCategory, NodeTag
 from cuvis_ai_schemas.pipeline import PortSpec
 
+from cuvis_ai_rfdetr._compat import base_kwargs
 from cuvis_ai_rfdetr.node.rfdetr_trainable import _DET_CLASS_NAMES, _SEG_CLASS_NAMES
 
 _LOSS_STAGES = {ExecutionStage.TRAIN, ExecutionStage.VAL, ExecutionStage.TEST}
@@ -33,6 +34,9 @@ class RFDETRCriterionLoss(Node):
 
     _category = NodeCategory.LOSS
     _tags = frozenset({NodeTag.DETECTION, NodeTag.TRAINING, NodeTag.DIFFERENTIABLE, NodeTag.TORCH})
+    # cuvis-ai-core >= 0.15 reads a node's stages from this class attribute; older cores take
+    # them from the constructor (see ``base_kwargs`` below). Both say train/val/test only.
+    EXECUTION_STAGES = frozenset(_LOSS_STAGES)
 
     INPUT_SPECS = {
         "outputs": PortSpec(
@@ -72,10 +76,8 @@ class RFDETRCriterionLoss(Node):
         self.resolution = int(resolution) if resolution is not None else None
 
         assert "execution_stages" not in kwargs, "loss nodes fix their own execution stages"
-        name, _ = Node.consume_base_kwargs(kwargs)
         super().__init__(
-            name=name,
-            execution_stages=_LOSS_STAGES,
+            **base_kwargs(kwargs, execution_stages=_LOSS_STAGES),
             dataset_dir=self.dataset_dir,
             variant=self.variant,
             segmentation=self.segmentation,

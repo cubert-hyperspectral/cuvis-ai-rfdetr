@@ -136,26 +136,35 @@ def targets_from_mask(
     mask: Tensor,
     with_masks: bool = False,
     min_pixels: int = 1,
+    multiclass: bool = False,
+    label_offset: int = 1,
 ) -> list[dict[str, Tensor]]:
     """Build DETR-style targets from an integer instance/class mask.
 
     Parameters
     ----------
     mask : Tensor
-        ``[B, H, W]`` integer mask, ``0`` = background. Connected components of
-        ``mask > 0`` become one target instance each (single foreign-object
-        class, label ``0``).
+        ``[B, H, W]`` integer mask, ``0`` = background, positive values are class ids.
     with_masks : bool
         Also emit per-instance boolean ``masks`` ``[N, H, W]`` (required by the
         segmentation criterion's mask losses).
     min_pixels : int
         Components smaller than this are ignored.
+    multiclass : bool
+        ``False`` (default): connected components of ``mask > 0`` become one target
+        instance each, all with label ``0`` — the single-class (foreign-object) case.
+        ``True``: for each distinct class value ``c > 0`` in the mask, connected
+        components of ``mask == c`` become instances with label ``c - label_offset``.
+    label_offset : int
+        Subtracted from each class value to map mask class ids to 0-indexed model
+        labels (default ``1``: COCO category ids 1/2/3 -> model classes 0/1/2, matching
+        RF-DETR's roboflow loader). Only used when ``multiclass`` is True.
 
     Returns
     -------
     list[dict[str, Tensor]]
         One dict per batch item: ``boxes`` ``[N, 4]`` normalized cxcywh
-        (resize-invariant), ``labels`` ``[N]`` int64 zeros, and optionally
+        (resize-invariant), ``labels`` ``[N]`` int64, and optionally
         ``masks`` ``[N, H, W]`` bool. Tensors live on ``mask``'s device.
     """
     from scipy import ndimage  # heavy import kept out of module import time
@@ -167,29 +176,38 @@ def targets_from_mask(
     _, height, width = m_np.shape
     out: list[dict[str, Tensor]] = []
     for b in range(m_np.shape[0]):
-        lbl, n = ndimage.label(m_np[b] > 0)
+        m = m_np[b]
+        # (binary_selector, class_label) pairs whose connected components become instances
+        if multiclass:
+            groups = [(m == c, int(c) - label_offset) for c in np.unique(m) if c > 0]
+        else:
+            groups = [(m > 0, 0)]
         boxes: list[list[float]] = []
+        labels: list[int] = []
         masks: list[np.ndarray] = []
-        for i in range(1, n + 1):
-            comp = lbl == i
-            if int(comp.sum()) < min_pixels:
-                continue
-            ys, xs = np.nonzero(comp)
-            x0, x1 = float(xs.min()), float(xs.max()) + 1.0
-            y0, y1 = float(ys.min()), float(ys.max()) + 1.0
-            boxes.append(
-                [
-                    (x0 + x1) / 2.0 / width,
-                    (y0 + y1) / 2.0 / height,
-                    (x1 - x0) / width,
-                    (y1 - y0) / height,
-                ]
-            )
-            if with_masks:
-                masks.append(comp)
+        for selector, class_label in groups:
+            lbl, n = ndimage.label(selector)
+            for i in range(1, n + 1):
+                comp = lbl == i
+                if int(comp.sum()) < min_pixels:
+                    continue
+                ys, xs = np.nonzero(comp)
+                x0, x1 = float(xs.min()), float(xs.max()) + 1.0
+                y0, y1 = float(ys.min()), float(ys.max()) + 1.0
+                boxes.append(
+                    [
+                        (x0 + x1) / 2.0 / width,
+                        (y0 + y1) / 2.0 / height,
+                        (x1 - x0) / width,
+                        (y1 - y0) / height,
+                    ]
+                )
+                labels.append(class_label)
+                if with_masks:
+                    masks.append(comp)
         target: dict[str, Tensor] = {
             "boxes": torch.tensor(boxes, dtype=torch.float32, device=device).reshape(-1, 4),
-            "labels": torch.zeros(len(boxes), dtype=torch.int64, device=device),
+            "labels": torch.tensor(labels, dtype=torch.int64, device=device),
         }
         if with_masks:
             target["masks"] = (
