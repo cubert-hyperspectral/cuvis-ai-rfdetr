@@ -15,3 +15,4 @@ capabilities:
   - class_name: cuvis_ai_rfdetr.node.score_fusion.ScoreFusion
   - class_name: cuvis_ai_rfdetr.node.fixed_pca_projection.FixedPCAProjection
   - class_name: cuvis_ai_rfdetr.node.carl_segmenter.CarlSegmenter
+  - class_name: cuvis_ai_rfdetr.node.sam_shell_gate.SamShellGate
