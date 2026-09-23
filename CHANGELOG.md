@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- Fair-robust training transforms in `cuvis_ai_rfdetr.transforms` (registered for `AugmentationCompose` via
+  `extra_transform_modules`, like `RandomMultiScaleResize`): `RandomZoom` (per-sample zoom out/in at a fixed
+  output size — shrink onto a median-filled canvas or crop-and-enlarge, mask resampled nearest-neighbour — for
+  camera-height changes), `RandomShading` (smooth spatial darkening field applied to all bands; unlike a global
+  gain it survives per-frame min-max normalisation — uneven or missing light), `RandomGammaContrast` (per-sample
+  gamma + contrast around the channel mean, floored at 0) and `RandomGaussianBlur` (per-sample separable Gaussian
+  blur with reflect padding — defocus). All draw from the compose's shared generator, apply per sample with
+  `prob`, keep shapes/dtypes and leave the mask aligned; tests in `tests/test_fair_transforms.py`.
 - `RFDETRTrainable` gains `multiclass_targets` (default False): `targets_from_mask` builds per-class DETR targets
   (label = mask class id - 1) instead of collapsing all foreground to one class — needed to train multi-class (e.g.
   shell/fo/fake) models in-pipeline.
