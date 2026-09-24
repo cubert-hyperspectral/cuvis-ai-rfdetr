@@ -1,15 +1,13 @@
 """CarlSegmenter — CARL (IMSY-DKFZ) hyperspectral semantic segmenter as a cuvis-ai node.
 
-Wraps the CARL ViT-Adapter/UperNet model trained on the 61-band walnut cubes (classes 0 bg / 1 shell / 2 fo /
-3 fake_shell) and emits a per-pixel score map for one class (default: shell). Preprocessing reproduces the training
-exporter + inference script exactly: per-cube scalar min-max to [0, 1], per-cube z-score, bilinear resize to
-``image_size``, forward ``model(x, wavelengths_nm / 1000, mean-band image)``, bilinear upsample of the logits back to
-the input size, softmax.
+Wraps a CARL ViT-Adapter/UperNet checkpoint and emits the per-pixel probability of one class
+(``score_class``) plus the argmax label map. Preprocessing matches CARL training: per-cube scalar min-max to
+[0, 1], per-cube z-score, bilinear resize to ``image_size``, forward ``model(x, wavelengths_nm / 1000,
+mean-band image)``, bilinear upsample of the logits back to the input size, softmax.
 
-TEMPORARY HOME: this node belongs in its own ``cuvis-ai-carl`` plugin; it lives here so the walnut live pipelines
-can be deployed together. The CARL repo is imported lazily from ``carl_repo`` on the first forward, so building /
-validating a pipeline does not require CARL to be installed. The compiled CUDA deform-attn op is optional (the
-pure-torch fallback is used when it is absent, which is fine for inference).
+The CARL code is imported lazily from ``carl_repo`` on the first forward, so building or validating a pipeline
+does not need CARL installed. The compiled CUDA deform-attn op is optional (CARL's pure-torch fallback is used
+when it is absent). Planned to move to its own plugin repository; see the README.
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ from cuvis_ai_rfdetr._compat import base_kwargs
 
 
 class CarlSegmenter(Node):
-    """CARL 61-band semantic segmentation -> per-pixel score map of one class (default shell)."""
+    """CARL hyperspectral semantic segmentation -> per-pixel score map of one class."""
 
     _category = NodeCategory.MODEL
     _tags = frozenset(
@@ -58,7 +56,7 @@ class CarlSegmenter(Node):
         "labels": PortSpec(
             dtype=torch.int32,
             shape=(-1, -1, -1),
-            description="Argmax class map [B, H, W] (0 bg / 1 shell / 2 fo / 3 fake_shell).",
+            description="Argmax class map [B, H, W] (class ids of the checkpoint).",
         ),
     }
 

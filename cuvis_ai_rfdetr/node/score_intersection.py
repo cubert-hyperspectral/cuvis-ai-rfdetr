@@ -2,7 +2,8 @@
 
 Two segmenters vote: a pixel keeps a high score only if BOTH gave it a high score, so thresholding the output at t is
 exactly "both maps >= t" (the ensemble intersection). Shapes must match ([B, H, W, 1] at the shared input resolution).
-Stateless, torch-native, differentiable; default {ALWAYS} stage.
+Stateless, torch-native, differentiable; default {ALWAYS} stage. Equivalent to ``ScoreFusion(mode="min")``;
+kept so existing pipelines that reference it keep loading.
 """
 
 from __future__ import annotations

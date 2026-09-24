@@ -1,12 +1,12 @@
-"""SamShellGate — gate a shell score map by full-spectrum spectral angle to a reference spectrum.
+"""SamShellGate — gate a score map by the full-spectrum spectral angle to a reference spectrum.
 
-Zeros out score-map pixels whose raw-cosine spectral angle (degrees) to a fixed reference exceeds
-``threshold_deg`` — i.e. keeps a pixel only where BOTH the segmenter says "shell" AND the pixel's spectrum matches
-the shell reference. Removes fake / off-spectrum pixels from a shell mask while keeping real-shell pixels (the
-validated per-pixel SAM filter). Raw cosine is illumination-scale-invariant (|pixel| cancels), so the calibrated
-threshold transfers across capture sessions. Reference is a fixed 61-band shell spectrum (mean over TRAIN shell
-pixels); magnitude is irrelevant (cosine), only the spectral shape. Stateless apart from the reference buffer,
-torch-native, default {ALWAYS} stage.
+Zeros out score-map pixels whose raw-cosine spectral angle (degrees) to a fixed reference spectrum exceeds
+``threshold_deg``, i.e. keeps a pixel only where BOTH the segmenter scores it AND its spectrum matches the
+reference. Used to drop look-alike objects with a different spectrum (e.g. plastic fakes of a natural product)
+from a segmentation mask while keeping the real ones. Raw cosine is illumination-scale invariant (|pixel|
+cancels), so a threshold calibrated on one capture session transfers to others. The reference is a fixed
+C-band spectrum (e.g. the mean over training pixels of the target class); only its shape matters, not its
+magnitude. Stateless apart from the reference buffer, torch-native, default stage set.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from cuvis_ai_rfdetr._compat import base_kwargs
 
 
 class SamShellGate(Node):
-    """Keep score-map pixels only where the spectral angle to a shell reference is <= threshold_deg."""
+    """Keep score-map pixels only where the spectral angle to the reference is <= threshold_deg."""
 
     _category = NodeCategory.TRANSFORM
     _tags = frozenset({NodeTag.SEGMENTATION, NodeTag.HYPERSPECTRAL, NodeTag.TORCH})

@@ -1,20 +1,18 @@
-"""FixedPCAProjection — cuvis-ai's TrainablePCA with a frozen, file-loaded projection and fixed unit scaling.
+"""FixedPCAProjection — cuvis-ai's TrainablePCA with a frozen, file-loaded projection and fixed scaling.
 
-Subclasses ``cuvis_ai.node.dimensionality_reduction.TrainablePCA`` (so the projection math is the library's, not a
-reimplementation) but loads mean / components / percentile range from an ``.npz`` given as an HPARAM instead of running
-``statistical_initialization``: the projection a downstream model was TRAINED on must never be refit at inference (the
-stateless ``PCA`` node refits per frame with arbitrary eigenvector signs — unusable in front of a trained model).
-It first min-maxes each input cube globally to [0, 1] (``input_global_minmax``, on by default): the exporter did this
-before fitting, so the fixed mean/comps assume that scale, and reproducing it makes the projection invariant to the
-caller's absolute reflectance scale — cuvis.next's ``CU3SDataNode`` delivers raw-scale reflectance, not [0, 1], which
-otherwise collapses the fixed projection (everything clamps to 1) and the downstream model sees a flat image. The
-min-max is global (one min/max over all H*W*C), matching the export; per-channel scaling would change the relative band
-magnitudes the fixed projection depends on, and it is idempotent on an already-[0, 1] cube. On top of the parent's
-``(x - mean) @ components.T`` it applies the exporter's fixed scaling ``(p - lo) / (hi - lo)``
-and clamps to [0, 1] — the clamp also protects ``to_uint8_frames``'s ``max <= 1.5`` range auto-detection from specular
-outliers. npz keys: ``mean`` [C], ``comps`` [K, C], ``lo`` [K], ``hi`` [K] (as written by the walnut PCA dataset export).
+Subclasses ``cuvis_ai.node.dimensionality_reduction.TrainablePCA`` (the projection math is the library's) but
+loads mean / components / percentile range from an ``.npz`` hparam instead of running
+``statistical_initialization``: the projection a downstream model was trained on must never be refit at
+inference (the stateless ``PCA`` node refits per frame with arbitrary eigenvector signs).
 
-TEMPORARY HOME: candidate for upstreaming into cuvis-ai next to TrainablePCA.
+``input_global_minmax`` (on by default) first min-maxes each cube globally to [0, 1] — one min / max over all
+H*W*C, as the projection export did before fitting. That makes the fixed projection invariant to the caller's
+absolute reflectance scale (cuvis.next's ``CU3SDataNode`` delivers raw-scale reflectance, which would otherwise
+push everything to the clamp and give the downstream model a flat image) and is idempotent on a [0, 1] cube.
+Per-channel scaling would change the relative band magnitudes the projection depends on. On top of the parent's
+``(x - mean) @ components.T`` it applies the fixed scaling ``(p - lo) / (hi - lo)`` and clamps to [0, 1] (the
+clamp also protects ``to_uint8_frames``' ``max <= 1.5`` range auto-detection from specular outliers).
+npz keys: ``mean`` [C], ``comps`` [K, C], ``lo`` [K], ``hi`` [K], optional ``explained`` [K].
 """
 
 from __future__ import annotations

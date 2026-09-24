@@ -1,11 +1,11 @@
 """ScoreFusion — combine two per-pixel score maps with a selectable rule.
 
-Generalizes ScoreIntersection (elementwise ``min``, the hard AND) to soft rules that recover recall the AND throws away:
-``mean`` (arithmetic), ``gmean`` (geometric, penalizes disagreement more than mean), ``wmean`` (weighted toward ``a``), and
-``max`` (OR). On the walnut deploy, fusing RF-DETR (RGB shell) with CARL (61-band, kernel-robust) at ``gmean``/``mean`` beats
-the ``min`` ensemble: live recall 0.850 -> 0.90-0.92 and 18-Aug IoU 0.947 -> 0.97 while kernel false positives stay ~45x below
-the single RGB model (see FUSION_170). Feed it un-thresholded score maps (RFDETRSegmenter ``threshold`` low, e.g. 0.05) so weak
-instances still contribute to the average. Shapes must match ([B, H, W, 1]); stateless, torch-native, differentiable.
+Generalizes ``ScoreIntersection`` (elementwise ``min``, the hard AND) with softer rules that keep recall the AND
+throws away: ``mean`` (arithmetic), ``gmean`` (geometric; penalizes disagreement more than ``mean``), ``wmean``
+(weighted toward ``a`` by ``weight``) and ``max`` (OR). Typical use: an ensemble of two segmenters whose score
+maps are fused and thresholded once downstream. Feed it un-thresholded score maps (e.g.
+``RFDETRSegmenter(threshold=0.05)``) so weak instances still contribute to the average. Shapes must match
+([B, H, W, 1]); stateless, torch-native, differentiable.
 """
 
 from __future__ import annotations
