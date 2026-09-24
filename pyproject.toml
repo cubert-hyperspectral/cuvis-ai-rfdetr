@@ -109,6 +109,9 @@ skips = ["B101"]
 [tool.coverage.run]
 source = ["cuvis_ai_rfdetr"]
 branch = true
+# transforms.py imports cuvis-ai-augment, which is git-tag-released and not installed in CI, so it cannot be
+# imported there; its tests (tests/test_transforms.py, tests/test_fair_transforms.py) run where augment is installed.
+omit = ["cuvis_ai_rfdetr/transforms.py"]
 
 [tool.coverage.report]
 show_missing = true
