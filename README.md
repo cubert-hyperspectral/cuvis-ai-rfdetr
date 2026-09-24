@@ -5,9 +5,19 @@ transformer — wrapped as a [cuvis.ai](https://github.com/cubert-hyperspectral)
 plugin for object / foreign-object detection and instance segmentation on RGB
 and false-color renderings of hyperspectral data.
 
-Five nodes: two inference wrappers (`RFDETRDetector`, `RFDETRSegmenter`), a
-false-color input builder (`PercentileComposite`), and an in-graph training
-pair (`RFDETRTrainable`, `RFDETRCriterionLoss`).
+Nodes:
+
+- inference wrappers `RFDETRDetector`, `RFDETRSegmenter`;
+- an in-graph training pair `RFDETRTrainable` + `RFDETRCriterionLoss`;
+- false-colour input builders `PercentileComposite`, `ScalarMinMaxBandSlice`,
+  `FixedPCAProjection`;
+- score-map ensembles and gating `ScoreFusion`, `ScoreIntersection`,
+  `SamShellGate`;
+- `CarlSegmenter` (CARL 61-band hyperspectral segmenter, optional).
+
+Plus training transforms for `cuvis-ai-augment`'s `AugmentationCompose`
+(`cuvis_ai_rfdetr.transforms`). Several of these are general-purpose and are
+planned to move to other ecosystem repos — see [Planned moves](#planned-moves).
 
 ## Licensing scope
 
@@ -21,7 +31,7 @@ this package. See `NOTICE` for attribution.
 ## Install
 
 ```bash
-pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.3.0"
+pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.4.0"
 ```
 
 Dependencies pull in the RF-DETR **core (inference) tier** only. The `rfdetr`
@@ -115,22 +125,95 @@ For runs that must match RF-DETR's own trainer exactly (EMA, LR schedule,
 multi-scale augmentation), fine-tuning with the upstream trainer and loading
 the checkpoint into the inference nodes remains the reference path.
 
+`RFDETRTrainable(multiclass_targets=True)` turns each mask class id `c > 0`
+into DETR label `c - 1` (e.g. COCO categories 1/2/3 → model classes 0/1/2);
+the default keeps the single-class behaviour (all foreground = label 0).
+
+## More input builders: `ScalarMinMaxBandSlice`, `FixedPCAProjection`
+
+- `ScalarMinMaxBandSlice(bands_nm=(640, 550, 470))` — `cube` + `wavelengths` →
+  `rgb_image [B, H, W, 3]` in [0, 1]: ONE min / max over the whole cube (band
+  ratios preserved), then the three bands nearest `bands_nm`. Use it when a
+  checkpoint was trained on that recipe; it is not the same image as a
+  per-channel stretch (`FixedWavelengthSelector(norm_mode="per_frame")`).
+- `FixedPCAProjection(projection_path=...)` — cuvis-ai's `TrainablePCA` with a
+  frozen projection loaded from an `.npz` (`mean` [C], `comps` [K, C], `lo` /
+  `hi` [K]); never refits at inference. `input_global_minmax` (default on)
+  min-maxes each cube globally first, so raw-scale reflectance (as cuvis.next
+  delivers it) and [0, 1] cubes give the same projection. Needs `cuvis-ai`
+  installed (parent class).
+
+## Ensembles and gating: `ScoreFusion`, `ScoreIntersection`, `SamShellGate`
+
+All take and return `scores [B, H, W, 1]` float32; stateless and torch-native.
+
+- `ScoreFusion(mode, weight)` — fuse two score maps (`a`, `b`): `min` (AND),
+  `max` (OR), `mean`, `gmean` (geometric), `wmean` (`weight`·a +
+  (1 − `weight`)·b). For ensembles feed un-thresholded maps (segmenter
+  `threshold` ≈ 0.05) and threshold the fused map once downstream.
+- `ScoreIntersection` — elementwise minimum; the same as
+  `ScoreFusion(mode="min")`, kept for existing pipelines.
+- `SamShellGate(reference, threshold_deg)` — zero the scores where the
+  raw-cosine spectral angle of the pixel's full spectrum (`cube`) to a fixed
+  reference spectrum exceeds `threshold_deg`; drops look-alike objects with a
+  different spectrum. Illumination-scale invariant.
+
+## Optional: `CarlSegmenter`
+
+CARL (IMSY-DKFZ) ViT-Adapter / UperNet semantic segmentation on the full
+cube (`cube` + `wavelengths`) → `scores` (probability of `score_class`) +
+`labels` (argmax map). CARL itself is imported lazily from `carl_repo` on the
+first forward, so pipelines build without it. Speed knobs: `precision`
+(`bf16` default), `band_step` (every k-th band), `compile` (+
+`compile_cache_dir` for a warm inductor cache).
+
+## Training transforms for `AugmentationCompose`
+
+`cuvis_ai_rfdetr.transforms` registers extra transforms with
+`cuvis-ai-augment`'s registry; list the module in the compose node's
+`extra_transform_modules` and use the names like built-in transforms. All
+apply per sample with probability `prob`, draw from the compose's shared
+generator (seeded runs are reproducible) and keep the mask aligned.
+
+| name | what it simulates | key hparams |
+| --- | --- | --- |
+| `RandomMultiScaleResize` | RF-DETR's native multi-scale training sizes | `scales` or `resolution` / `patch_size` / `num_windows` |
+| `RandomZoom` | camera height change (zoom out onto a median canvas / crop and enlarge) | `scale_range` (0.5, 2.0) |
+| `RandomShading` | uneven or missing light (smooth darkening field on all bands) | `strength_range`, `grid` |
+| `RandomGammaContrast` | tone-curve changes | `gamma_range`, `contrast_range` |
+| `RandomGaussianBlur` | defocus | `sigma_range` |
+
+`cuvis-ai-augment` is not a pip dependency of this plugin (it is released by
+git tag); importing `cuvis_ai_rfdetr.transforms` without it raises a clear
+error.
+
 ## Plugin manifest
 
 The repository root ships a local-path manifest (`plugins.yaml`) exposing all
-five nodes. Released consumers should pin the git source instead:
+nodes. Released consumers should pin the git source instead (the nodes after
+`PercentileComposite` ship from the first release after v0.4.0; until it is
+tagged, use the local-path manifest):
 
 ```yaml
 name: rfdetr
 repo: "https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git"
-tag: "v0.3.0"
+tag: "v0.5.0"
+package_name: cuvis-ai-rfdetr
 capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_detector.RFDETRDetector
   - class_name: cuvis_ai_rfdetr.node.rfdetr_segmenter.RFDETRSegmenter
   - class_name: cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable
   - class_name: cuvis_ai_rfdetr.node.rfdetr_loss.RFDETRCriterionLoss
   - class_name: cuvis_ai_rfdetr.node.percentile_composite.PercentileComposite
+  - class_name: cuvis_ai_rfdetr.node.scalar_minmax_bandslice.ScalarMinMaxBandSlice
+  - class_name: cuvis_ai_rfdetr.node.fixed_pca_projection.FixedPCAProjection
+  - class_name: cuvis_ai_rfdetr.node.score_fusion.ScoreFusion
+  - class_name: cuvis_ai_rfdetr.node.score_intersection.ScoreIntersection
+  - class_name: cuvis_ai_rfdetr.node.sam_shell_gate.SamShellGate
+  - class_name: cuvis_ai_rfdetr.node.carl_segmenter.CarlSegmenter
 ```
+
+`package_name` lets cuvis.next's per-pipeline child env install the plugin.
 
 ## Example: tiled false-color pipeline (nodes only)
 
@@ -153,6 +236,22 @@ nodes:
 connections:
   - { source: composite.outputs.rgb_image, target: segmenter.inputs.rgb_image }
 ```
+
+## Planned moves
+
+Several nodes here are general-purpose and only live in this repo so the
+walnut deploy pipelines could ship together. Tracked moves:
+
+| what | destination | issue |
+| --- | --- | --- |
+| `RandomZoom`, `RandomShading`, `RandomGammaContrast`, `RandomGaussianBlur` | `cuvis-ai-augment` | #13 |
+| `ScoreFusion`, `SamShellGate` (→ generic `SpectralAngleGate`); retire `ScoreIntersection` | `cuvis-ai` builtins | #14 |
+| `ScalarMinMaxBandSlice`, `FixedPCAProjection` (optional: `PercentileComposite`) | `cuvis-ai` builtins | #15 |
+| `CarlSegmenter` | new `cuvis-ai-carl` plugin | #16 |
+| `_compat.base_kwargs` (core < 0.15 shim) | delete once the core floor is ≥ 0.15 | #17 |
+
+Moves happen in the destination first; pipelines and consumer manifests switch
+over; the code is removed here last.
 
 ## Tests
 

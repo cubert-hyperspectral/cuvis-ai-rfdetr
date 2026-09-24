@@ -11,10 +11,11 @@
   gamma + contrast around the channel mean, floored at 0) and `RandomGaussianBlur` (per-sample separable Gaussian
   blur with reflect padding — defocus). All draw from the compose's shared generator, apply per sample with
   `prob`, keep shapes/dtypes and leave the mask aligned; tests in `tests/test_fair_transforms.py`.
-- `SamShellGate` node — gates a shell score map by the full-spectrum spectral angle to a fixed shell reference
-  spectrum (raw cosine, so illumination-scale invariant): pixels whose angle exceeds `threshold_deg` are zeroed, so
-  fake / off-spectrum pixels drop out of the shell mask while real-shell pixels stay. Used by the walnut
-  `ens_sam_t13` / `ens_sam_t11` deploy pipelines; tests in `tests/test_sam_shell_gate.py`.
+  Planned move to `cuvis-ai-augment` (#13).
+- `SamShellGate` node — gates a score map by the full-spectrum spectral angle to a fixed reference spectrum
+  (raw cosine, so illumination-scale invariant): pixels whose angle exceeds `threshold_deg` are zeroed, so
+  look-alike objects with a different spectrum drop out of the mask while the real ones stay; tests in
+  `tests/test_sam_shell_gate.py`. Planned move to `cuvis-ai` as a generic `SpectralAngleGate` (#14).
 - `RFDETRTrainable` gains `multiclass_targets` (default False): `targets_from_mask` builds per-class DETR targets
   (label = mask class id - 1) instead of collapsing all foreground to one class — needed to train multi-class (e.g.
   shell/fo/fake) models in-pipeline.
@@ -27,28 +28,35 @@
   everything clamps to 1 and the mask goes empty). The min-max is global (one min/max over all H*W*C), matching the
   export; per-channel scaling (`MinMaxNormalizer`) does not reproduce it. Exposes only the `projected` output port (the
   parent's `components`/`explained_variance_ratio` ports are dropped — non-image ports break cuvis.next's per-output
-  display/mask handling).
-- `ScoreFusion` node — combine two score maps by `min`/`max`/`mean`/`gmean`/`wmean` (generalizes `ScoreIntersection`).
-  Soft fusion of RF-DETR (RGB shell) with CARL (61-band) at `gmean`/`mean` beats the `min` ensemble on the walnut set
-  (live recall 0.850 -> 0.90-0.92, 18-Aug IoU 0.947 -> 0.97; kernel FP stays ~45x below the single RGB model).
+  display/mask handling). Planned move to `cuvis-ai` (#15).
+- `ScoreFusion` node — combine two score maps by `min`/`max`/`mean`/`gmean`/`wmean` (generalizes
+  `ScoreIntersection`) for two-segmenter ensembles; the soft rules keep recall that the hard AND (`min`) loses.
+  Planned move to `cuvis-ai` (#14).
 - `ScalarMinMaxBandSlice` (`cuvis_ai_rfdetr.node.scalar_minmax_bandslice`): cube -> 3-band false-colour
   composite using ONE scalar min-max over the whole cube (all bands together, so relative band
   intensities are preserved) followed by nearest-band selection (`argmin |wavelength - nm|`), output
-  float32 in [0, 1]. This is the exact input recipe the walnut RF-DETR checkpoints were trained on;
+  float32 in [0, 1]. This is the input recipe some 3-band RF-DETR checkpoints were trained on;
   `PercentileComposite` (per-band percentile stretch) and cuvis-ai's `FixedWavelengthSelector`
   (per-band per-frame / running normalisation) do not reproduce it. Verified byte-exact against the
-  training exporter. Temporary home — candidate for upstreaming to cuvis-ai's channel selectors.
+  training exporter. Planned move to cuvis-ai's channel selectors (#15).
 - `ScoreIntersection` (`cuvis_ai_rfdetr.node.score_intersection`): elementwise minimum of two
   `[B, H, W, 1]` score maps — the soft AND of two segmenters (thresholding the output at t is exactly
   "both >= t"). Enables two-model ensembles (e.g. RGB ∩ 870-nm RF-DETR) inside one pipeline; torch-native,
-  stateless. Temporary home — candidate for a generic mask/score logic node in cuvis-ai.
+  stateless. Same as `ScoreFusion(mode="min")`; retirement tracked in #14.
 - `CarlSegmenter` (`cuvis_ai_rfdetr.node.carl_segmenter`): the CARL (IMSY-DKFZ) 61-band ViT-Adapter/UperNet
   segmenter as a node — per-cube min-max + z-score + resize preprocessing (the training recipe), lazy import of the
   CARL repo from `carl_repo`, softmax score map of one class + argmax labels; preprocessing runs on the model
   device and the forward uses bf16 autocast by default (`precision` hparam: bf16 | fp16 | fp32) — 1.6x faster
   than fp32 with identical masks; `band_step` (every k-th band + its wavelengths; k=2 is ~1.45x faster at 0.999
-  agreement) and opt-in `compile` + `compile_cache_dir` (torch.compile/inductor, ~1.6x, bit-identical; needs triton; warm cache restarts in ~30 s). Temporary home —
-  belongs in a `cuvis-ai-carl` plugin.
+  agreement) and opt-in `compile` + `compile_cache_dir` (torch.compile/inductor, ~1.6x, bit-identical; needs
+  triton; warm cache restarts in ~30 s). Planned move to a `cuvis-ai-carl` plugin (#16).
+
+### Changed
+- README documents every node (input builders, score fusion / gating, `CarlSegmenter`, the training
+  transforms) and the planned moves of the general-purpose nodes to other ecosystem repos (#13-#17).
+- `ScalarMinMaxBandSlice` routes its base kwargs through `base_kwargs` like the other nodes (a yaml
+  `execution_stages: null` no longer reaches `Node` on cuvis-ai-core >= 0.15) and imports the palette
+  enums unconditionally; node docstrings describe the nodes generically. No behaviour change.
 
 ### Fixed
 - Compatible with cuvis-ai-core >= 0.15, where execution stages became class-level and
@@ -56,7 +64,8 @@
   now forward base kwargs through `cuvis_ai_rfdetr._compat.base_kwargs`, which keeps the
   pre-0.15 behaviour on older cores (per-instance stage override from the yaml) and passes only
   `name` on newer ones. `RFDETRCriterionLoss` declares its `{train, val, test}` stages as
-  `EXECUTION_STAGES` for the new mechanism (the constructor still fixes them on old cores).
+  `EXECUTION_STAGES` for the new mechanism (the constructor still fixes them on old cores). The shim goes
+  once the core floor is >= 0.15 (#17).
 
 ## [0.4.0] - 2026-08-14
 
