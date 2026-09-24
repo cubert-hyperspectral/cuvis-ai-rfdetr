@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- `RFDETRSegmenter` speed hparams: `fast_paste` (default True) combines all instance masks of a prediction
+  with one masked max on the input's device instead of one boolean-indexed CPU write per instance (bit-identical;
+  `False` restores the per-instance paste); opt-in `gpu_input` hands rfdetr the frame as a float tensor on the
+  input's device, quantized like the uint8 frame and bit-identical to the NumPy path on rfdetr 1.10 (not with
+  `jpeg_roundtrip`); opt-in `precision` (`fp32` | `fp16` | `bf16`) and `jit_trace` run rfdetr's
+  `model.inference(dtype=..., compile=...)` once when the model is built (`optimize_for_inference` on older
+  releases). New helpers `functional.to_unit_frames` and `functional.max_paste_masks`; tests in
+  `tests/test_segmenter_speed_options.py`.
 - Fair-robust training transforms in `cuvis_ai_rfdetr.transforms` (registered for `AugmentationCompose` via
   `extra_transform_modules`, like `RandomMultiScaleResize`): `RandomZoom` (per-sample zoom out/in at a fixed
   output size — shrink onto a median-filled canvas or crop-and-enlarge, mask resampled nearest-neighbour — for
@@ -52,6 +60,8 @@
   triton; warm cache restarts in ~30 s). Planned move to a `cuvis-ai-carl` plugin (#16).
 
 ### Changed
+- `RFDETRSegmenter` passes `include_source_image=False` to `predict` when the installed rfdetr accepts it (the
+  node never reads the attached source image; saves one frame copy per call, predictions unchanged).
 - README documents every node (input builders, score fusion / gating, `CarlSegmenter`, the training
   transforms) and the planned moves of the general-purpose nodes to other ecosystem repos (#13-#17).
 - `ScalarMinMaxBandSlice` routes its base kwargs through `base_kwargs` like the other nodes (a yaml

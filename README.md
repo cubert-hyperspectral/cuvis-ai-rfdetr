@@ -93,6 +93,21 @@ built around per-tile JPEG files and top-fraction image scores):
   (e.g. exactly 400 px of a 987×405 map), directly comparable to dense
   segmentation models scored the same way.
 
+Segmenter speed hyperparameters (`RFDETRSegmenter` only). `fast_paste` is on
+by default because it changes no number; the other three are opt-in:
+
+| Hparam | Default | What it does | Output vs default |
+| --- | --- | --- | --- |
+| `fast_paste` | `True` | Combines all instance masks of a prediction with one masked max on the input image's device, instead of one boolean-indexed write per instance into a CPU canvas. `False` restores the per-instance CPU paste. | bit-identical |
+| `gpu_input` | `False` | Hands each frame to rfdetr as a `[0, 1]` float tensor on the input's device, quantized exactly like the uint8 frame, instead of copying it to a CPU uint8 NumPy array that rfdetr then copies back. Not combinable with `jpeg_roundtrip`. | bit-identical (rfdetr 1.10, CUDA) |
+| `precision` | `"fp32"` | `"fp16"` / `"bf16"`: rfdetr's `model.inference(dtype=...)` exports and casts the network once, when the model is built. Needs CUDA. | rounding: pixels at a downstream threshold can flip |
+| `jit_trace` | `False` | `torch.jit.trace` of the exported network (rfdetr's `model.inference(compile=True)`) for its fixed `1 × 3 × resolution × resolution` input; removes the Python overhead of the forward pass. Traces on the first frame (a few seconds). | as `precision` |
+
+The node never reads the source image rfdetr can attach to its predictions,
+so it passes `include_source_image=False` whenever the installed rfdetr
+accepts it. This saves one frame copy per call and leaves the predictions
+unchanged.
+
 The wrapped model manages its own device placement and is intentionally not a
 registered submodule: `node.to(...)` does not move it.
 

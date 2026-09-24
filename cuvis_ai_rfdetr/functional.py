@@ -1,6 +1,7 @@
 """Shared functional helpers for the cuvis-ai-rfdetr nodes.
 
-Pure functions used by the inference nodes (tile merging) and the trainable
+Pure functions used by the inference nodes (input conversion, mask pasting,
+tile merging) and the trainable
 node / criterion loss (DETR target construction). Kept import-light: ``rfdetr``
 is never imported here; ``scipy`` is imported lazily inside
 :func:`targets_from_mask`.
@@ -67,6 +68,51 @@ def to_uint8_frames(rgb_image: Tensor) -> np.ndarray:
     if x.numel() > 0 and float(x.max()) <= 1.5:
         x = x * 255.0
     return x.clamp(0.0, 255.0).round().to(torch.uint8).contiguous().numpy()
+
+
+def to_unit_frames(rgb_image: Tensor) -> Tensor:
+    """``[B, H, W, 3]`` float input -> float32 ``[B, H, W, 3]`` in ``[0, 1]`` on the input's device.
+
+    The quantization of :func:`to_uint8_frames` without leaving the device: the values are exactly
+    ``to_uint8_frames(rgb_image) / 255``. The divisor is a 0-dim tensor on the input's device,
+    which keeps IEEE-754 correctly rounded division on CUDA (a Python-number divisor is evaluated
+    there as a multiplication by its reciprocal, one ULP off for about half of the byte values),
+    so the frame equals rfdetr's own uint8 -> float conversion bit for bit.
+    """
+    x = rgb_image.detach().to(dtype=torch.float32)
+    if x.numel() > 0 and float(x.max()) <= 1.5:
+        x = x * 255.0
+    levels = x.clamp(0.0, 255.0).round()
+    return levels / torch.tensor(255.0, dtype=torch.float32, device=levels.device)
+
+
+def max_paste_masks(
+    canvas: Tensor, masks, confidences, row_offset: int = 0, chunk: int = 16
+) -> None:
+    """Max-paste instance masks x confidence into ``canvas`` ``[H, W]`` in place, on its device.
+
+    ``masks`` holds ``N`` boolean ``[h, w]`` masks (NumPy arrays or tensors, one per instance),
+    placed at ``row_offset``; rows and columns outside the canvas are clipped. Same result, bit for
+    bit, as pasting the instances one by one with ``canvas[m] = max(canvas[m], conf)`` (max is
+    order-independent), but computed as one masked max per ``chunk`` instances on the canvas's
+    device instead of one boolean-indexed write per instance. ``chunk`` bounds the float32
+    intermediate to ``chunk x h x w``.
+    """
+    if len(confidences) == 0:
+        return
+    stacked = torch.stack([torch.as_tensor(m, dtype=torch.bool) for m in masks])
+    h, w = canvas.shape
+    rows = min(stacked.shape[1], h - row_offset)
+    cols = min(stacked.shape[2], w)
+    if rows <= 0 or cols <= 0:
+        return
+    stacked = stacked[:, :rows, :cols].to(canvas.device)
+    conf = torch.as_tensor(confidences, dtype=canvas.dtype, device=canvas.device).view(-1, 1, 1)
+    floor = torch.full((), float("-inf"), dtype=canvas.dtype, device=canvas.device)
+    region = canvas[row_offset : row_offset + rows, :cols]
+    for start in range(0, stacked.shape[0], chunk):
+        top = torch.where(stacked[start : start + chunk], conf[start : start + chunk], floor)
+        torch.maximum(region, top.amax(dim=0), out=region)
 
 
 def jpeg_roundtrip(frame_u8: np.ndarray, quality: int = 95) -> np.ndarray:
