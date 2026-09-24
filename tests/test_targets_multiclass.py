@@ -32,4 +32,3 @@ def test_multiclass_labels_offset():
 def test_multiclass_label_offset_zero():
     t = targets_from_mask(_mask(), multiclass=True, label_offset=0)[0]
     assert sorted(t["labels"].tolist()) == [1, 2, 3, 3]  # ids used directly
-

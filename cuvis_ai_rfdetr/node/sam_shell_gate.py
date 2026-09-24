@@ -29,24 +29,40 @@ class SamShellGate(Node):
     _tags = frozenset({NodeTag.SEGMENTATION, NodeTag.HYPERSPECTRAL, NodeTag.TORCH})
 
     INPUT_SPECS = {
-        "cube": PortSpec(dtype=torch.float32, shape=(-1, -1, -1, -1),
-                         description="Hyperspectral cube [B, H, W, C]."),
-        "scores": PortSpec(dtype=torch.float32, shape=(-1, -1, -1, 1),
-                           description="Shell score map [B, H, W, 1] to be gated."),
+        "cube": PortSpec(
+            dtype=torch.float32,
+            shape=(-1, -1, -1, -1),
+            description="Hyperspectral cube [B, H, W, C].",
+        ),
+        "scores": PortSpec(
+            dtype=torch.float32,
+            shape=(-1, -1, -1, 1),
+            description="Shell score map [B, H, W, 1] to be gated.",
+        ),
     }
     OUTPUT_SPECS = {
-        "scores": PortSpec(dtype=torch.float32, shape=(-1, -1, -1, 1),
-                           description="Gated score map [B, H, W, 1]: input where angle<=T, else 0."),
+        "scores": PortSpec(
+            dtype=torch.float32,
+            shape=(-1, -1, -1, 1),
+            description="Gated score map [B, H, W, 1]: input where angle<=T, else 0.",
+        ),
     }
 
-    def __init__(self, reference: list[float], threshold_deg: float, eps: float = 1e-12, **kwargs: Any) -> None:
+    def __init__(
+        self, reference: list[float], threshold_deg: float, eps: float = 1e-12, **kwargs: Any
+    ) -> None:
         ref = torch.as_tensor(reference, dtype=torch.float32).flatten()
         if ref.numel() < 2:
             raise ValueError(f"reference must be a >=2-band spectrum, got {ref.numel()} values")
         self.threshold_deg = float(threshold_deg)
         self.eps = float(eps)
-        super().__init__(**base_kwargs(kwargs), reference=[float(x) for x in ref.tolist()],
-                         threshold_deg=self.threshold_deg, eps=self.eps, **kwargs)
+        super().__init__(
+            **base_kwargs(kwargs),
+            reference=[float(x) for x in ref.tolist()],
+            threshold_deg=self.threshold_deg,
+            eps=self.eps,
+            **kwargs,
+        )
         self.register_buffer("_ref", ref)
 
     def forward(self, cube: Tensor, scores: Tensor, **_: Any) -> dict[str, Tensor]:
