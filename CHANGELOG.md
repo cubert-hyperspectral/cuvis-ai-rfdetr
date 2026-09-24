@@ -11,6 +11,10 @@
   gamma + contrast around the channel mean, floored at 0) and `RandomGaussianBlur` (per-sample separable Gaussian
   blur with reflect padding — defocus). All draw from the compose's shared generator, apply per sample with
   `prob`, keep shapes/dtypes and leave the mask aligned; tests in `tests/test_fair_transforms.py`.
+- `SamShellGate` node — gates a shell score map by the full-spectrum spectral angle to a fixed shell reference
+  spectrum (raw cosine, so illumination-scale invariant): pixels whose angle exceeds `threshold_deg` are zeroed, so
+  fake / off-spectrum pixels drop out of the shell mask while real-shell pixels stay. Used by the walnut
+  `ens_sam_t13` / `ens_sam_t11` deploy pipelines; tests in `tests/test_sam_shell_gate.py`.
 - `RFDETRTrainable` gains `multiclass_targets` (default False): `targets_from_mask` builds per-class DETR targets
   (label = mask class id - 1) instead of collapsing all foreground to one class — needed to train multi-class (e.g.
   shell/fo/fake) models in-pipeline.
