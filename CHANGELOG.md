@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Added
+- `RFDETRSegmenter` TensorRT backend: `backend="tensorrt"` runs a TensorRT engine compiled from the network (via
+  rfdetr's own ONNX export) in place of the PyTorch network, with rfdetr's pre- and post-processing unchanged
+  around it. `precision` selects the engine: `fp32` is TensorRT's default build with TF32 allowed, `fp16` uses the
+  FP16 builder flag (TensorRT 10). `engine_dir` defaults to `<checkpoint>.trt/` and holds per-machine engines
+  named by precision, resolution, GPU and TensorRT version, each with a JSON build record; the checkpoint MD5 is
+  checked at load. New module `cuvis_ai_rfdetr.trt_engine` builds engines and runs them on torch's CUDA stream,
+  with a CLI: `python -m cuvis_ai_rfdetr.trt_engine build | build-pipeline`. TensorRT and onnx are optional,
+  CUDA-specific installs (`tensorrt-cu12` / `tensorrt-cu13`), not plugin dependencies. Tests in
+  `tests/test_segmenter_tensorrt.py` are mocked; one `slow` test builds and runs a real engine.
 - `RFDETRSegmenter` speed hparams: `fast_paste` (default True) combines all instance masks of a prediction
   with one masked max on the input's device instead of one boolean-indexed CPU write per instance (bit-identical;
   `False` restores the per-instance paste); opt-in `gpu_input` hands rfdetr the frame as a float tensor on the

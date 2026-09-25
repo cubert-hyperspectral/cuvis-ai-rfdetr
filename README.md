@@ -108,6 +108,48 @@ so it passes `include_source_image=False` whenever the installed rfdetr
 accepts it. This saves one frame copy per call and leaves the predictions
 unchanged.
 
+### TensorRT backend (`RFDETRSegmenter`)
+
+`backend="tensorrt"` runs a TensorRT engine compiled from the network in
+place of the PyTorch network. rfdetr's own preprocessing (uint8 / 255,
+bilinear resize without antialias, mean / std) and post-processing
+(`model.model.postprocess`, `scores > threshold`) run around it unchanged,
+so everything after the network (`tiling`, `class_filter`, paste, NMS,
+`score_reduction`) behaves as with `backend="torch"`.
+
+| Hparam | Default | What it does |
+| --- | --- | --- |
+| `backend` | `"torch"` | `"tensorrt"`: run this machine's TensorRT engine. Needs CUDA and the `tensorrt` package. `jit_trace` does not apply. |
+| `precision` | `"fp32"` | With `backend="tensorrt"` it selects the engine. `"fp32"` is TensorRT's default float build, which allows TF32 math like the PyTorch default after `import rfdetr`. `"fp16"` uses the FP16 builder flag, which needs TensorRT 10. |
+| `engine_dir` | `None` | Where the engines are kept; `None` means `<checkpoint_path>.trt/`. |
+
+An engine only runs on the GPU and the TensorRT version it was built with,
+so it is built once per machine before the first run. The network is
+exported with rfdetr's own ONNX exporter and compiled with the TensorRT
+Python API:
+
+```bash
+python -m cuvis_ai_rfdetr.trt_engine build-pipeline pipeline.yaml   # every backend: tensorrt segmenter
+python -m cuvis_ai_rfdetr.trt_engine build --checkpoint W.pth --variant large --resolution 504 --precision fp16
+```
+
+Engine files are named
+`<precision>_r<resolution>_<GPU>-sm<capability>_trt<TensorRT version>.engine`,
+so the engines of several machines can share one directory. Each engine has
+a `.json` build record next to it. The node refuses an engine whose record
+names a different checkpoint, and a missing engine fails with the exact
+build command.
+
+TensorRT and `onnx` (needed for building) are not plugin dependencies,
+because the right wheel depends on torch's CUDA. Install `tensorrt-cu12` for
+a CUDA 12 torch or `tensorrt-cu13` for a CUDA 13 torch, version 10.x, plus
+`onnx`.
+
+Example: RF-DETR-Seg-L at 504 px on a Jetson AGX Thor. The network takes
+29 ms in PyTorch fp32, 20 ms as a TensorRT fp32 engine and 6 ms as a TensorRT
+fp16 engine. Results differ from PyTorch only by rounding, so pixels whose
+score sits at a downstream threshold can flip.
+
 The wrapped model manages its own device placement and is intentionally not a
 registered submodule: `node.to(...)` does not move it.
 

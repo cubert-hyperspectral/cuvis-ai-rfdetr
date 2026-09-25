@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import os
 from typing import Any
 
 import torch
@@ -44,6 +45,11 @@ _PRECISION_DTYPES: dict[str, torch.dtype] = {
     "bf16": torch.bfloat16,
 }
 
+#: Network backends: rfdetr's PyTorch network, or a TensorRT engine built from it.
+_BACKENDS = ("torch", "tensorrt")
+#: ``precision`` values a TensorRT engine can be built with.
+_TRT_PRECISIONS = ("fp32", "fp16")
+
 
 class RFDETRSegmenter(Node):
     """Single-frame instance segmentation using the official Roboflow RF-DETR-Seg.
@@ -66,7 +72,8 @@ class RFDETRSegmenter(Node):
 
     Inference speed: instance masks are combined on the input's device by
     default (``fast_paste``, bit-identical to the per-instance paste);
-    ``precision``, ``jit_trace`` and ``gpu_input`` are opt-in (see ``__init__``).
+    ``precision``, ``jit_trace``, ``gpu_input`` and the TensorRT ``backend`` are
+    opt-in (see ``__init__``).
     """
 
     _category = NodeCategory.MODEL
@@ -133,6 +140,8 @@ class RFDETRSegmenter(Node):
         precision: str = "fp32",
         jit_trace: bool = False,
         gpu_input: bool = False,
+        backend: str = "torch",
+        engine_dir: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Configure the segmenter without loading any weights yet.
@@ -200,6 +209,23 @@ class RFDETRSegmenter(Node):
           uint8 NumPy array, which skips the device -> CPU -> device round
           trip. Not combinable with ``jpeg_roundtrip``, which encodes the CPU
           frame.
+
+        Network backend:
+
+        - ``backend``: ``"torch"`` (default) runs rfdetr's PyTorch network.
+          ``"tensorrt"`` runs a TensorRT engine compiled from the same network
+          instead, with rfdetr's own pre- and post-processing around it
+          (see :mod:`cuvis_ai_rfdetr.trt_engine`). ``precision`` then selects
+          the engine: ``"fp32"`` (TensorRT's default float build, TF32 math
+          allowed like the PyTorch default after ``import rfdetr``) or
+          ``"fp16"``; ``jit_trace`` does not apply. Engines are specific to one
+          GPU and TensorRT version and are built once per machine, before the
+          first run: ``python -m cuvis_ai_rfdetr.trt_engine build-pipeline
+          <pipeline.yaml>``. Needs a CUDA device and the ``tensorrt`` package.
+        - ``engine_dir``: where the engines are kept (default:
+          ``<checkpoint_path>.trt/``). Engine file names carry the precision,
+          resolution, GPU and TensorRT version, so the engines of several
+          machines can share one directory.
         """
         variant_key = str(variant).lower()
         if variant_key not in _SEG_VARIANT_CLASS_NAMES:
@@ -263,6 +289,21 @@ class RFDETRSegmenter(Node):
                 "RFDETRSegmenter: jpeg_roundtrip encodes the CPU uint8 frame and cannot be "
                 "combined with gpu_input."
             )
+        backend = str(backend).lower()
+        if backend not in _BACKENDS:
+            raise ValueError(
+                f"RFDETRSegmenter: backend must be one of {_BACKENDS}, got {backend!r}."
+            )
+        if backend == "tensorrt":
+            if precision not in _TRT_PRECISIONS:
+                raise ValueError(
+                    f"RFDETRSegmenter: backend='tensorrt' builds engines with precision "
+                    f"{_TRT_PRECISIONS}, got {precision!r}."
+                )
+            if jit_trace:
+                raise ValueError("RFDETRSegmenter: jit_trace applies to backend='torch' only.")
+        if engine_dir is not None:
+            engine_dir = str(engine_dir)
 
         self.checkpoint_path = checkpoint_path
         self.variant = variant_key
@@ -282,6 +323,8 @@ class RFDETRSegmenter(Node):
         self.precision = precision
         self.jit_trace = jit_trace
         self.gpu_input = gpu_input
+        self.backend = backend
+        self.engine_dir = engine_dir
 
         super().__init__(
             **base_kwargs(kwargs),
@@ -303,20 +346,64 @@ class RFDETRSegmenter(Node):
             precision=self.precision,
             jit_trace=self.jit_trace,
             gpu_input=self.gpu_input,
+            backend=self.backend,
+            engine_dir=self.engine_dir,
             **kwargs,
         )
 
         # Lazily constructed on the first forward; rfdetr manages its own
         # device, so the model must NOT become a registered submodule.
         self._model: Any = None
+        # TensorRT engine of the network (backend='tensorrt'), loaded with the model.
+        self._engine: Any = None
         # Extra predict() kwargs, resolved once per model from its signature.
         self._predict_kwargs: dict[str, Any] = {}
         self._predict_kwargs_for: Any = None
 
     def _ensure_model(self) -> Any:
         if self._model is None:
-            self._model = self._apply_inference_options(self._build_model())
+            model = self._build_model()
+            if self.backend == "tensorrt":
+                self._engine = self._load_engine(model)
+            else:
+                model = self._apply_inference_options(model)
+            self._model = model
         return self._model
+
+    def _load_engine(self, model: Any) -> Any:
+        """This machine's TensorRT engine for the network of ``model``, built beforehand."""
+        from cuvis_ai_rfdetr import trt_engine
+
+        device = torch.device(model.model.device)
+        if device.type != "cuda":
+            raise RuntimeError("RFDETRSegmenter: backend='tensorrt' needs a CUDA device.")
+        resolution = int(model.model.resolution)
+        engine_dir = self.engine_dir or trt_engine.default_engine_dir(self.checkpoint_path)
+        path = os.path.join(
+            engine_dir, trt_engine.engine_file_name(self.precision, resolution, device)
+        )
+        if not os.path.exists(path):
+            build = (
+                f"python -m cuvis_ai_rfdetr.trt_engine build --checkpoint {self.checkpoint_path} "
+                f"--variant {self.variant} --resolution {resolution} --precision {self.precision}"
+            )
+            if self.checkpoint_loader != "constructor":
+                build += f" --checkpoint-loader {self.checkpoint_loader}"
+            if self.engine_dir:
+                build += f" --engine-dir {self.engine_dir}"
+            raise FileNotFoundError(
+                f"RFDETRSegmenter: no TensorRT engine for this machine at {path}. "
+                f"Build it once with: {build}"
+            )
+        trt_engine.check_engine_matches(path, self.checkpoint_path)
+        engine = trt_engine.TensorRTEngine(path, device)
+        expected = (1, 3, resolution, resolution)
+        if tuple(engine.input_shape) != expected:
+            raise RuntimeError(
+                f"RFDETRSegmenter: TensorRT engine {path} takes input "
+                f"{tuple(engine.input_shape)}, the model needs {expected}; rebuild it."
+            )
+        return engine
 
     def _apply_inference_options(self, model: Any) -> Any:
         """Export / cast / trace the network per ``precision`` and ``jit_trace``.
@@ -405,6 +492,8 @@ class RFDETRSegmenter(Node):
         ``frame`` is a uint8 NumPy array, or with ``gpu_input`` a ``[0, 1]``
         float tensor, which rfdetr takes channel-first.
         """
+        if self.backend == "tensorrt":
+            return self._predict_frame_trt(model, frame)
         if isinstance(frame, Tensor):
             frame = frame.permute(2, 0, 1).contiguous()
         result = model.predict(frame, threshold=self.threshold, **self._extra_predict_kwargs(model))
@@ -427,6 +516,47 @@ class RFDETRSegmenter(Node):
             m = inst_masks[j] if inst_masks is not None else None
             rows.append((x1, y1, x2, y2, conf, cid, m))
         return rows
+
+    def _predict_frame_trt(self, model: Any, frame: Any) -> list[tuple]:
+        """One HWC frame through the TensorRT engine, with rfdetr's own pre- and post-processing.
+
+        The steps of ``model.predict`` with the engine in place of the network:
+        the frame in ``[0, 1]`` (a uint8 frame widened on the device and divided
+        by a 255 tensor, as rfdetr does), bilinear resize without antialias to
+        the model resolution, mean / std normalisation, the engine, rfdetr's
+        post-processing with the node threshold, ``scores > threshold``. The
+        instance masks stay on the device.
+        """
+        import torchvision.transforms.functional as tvf
+
+        device = self._engine.device
+        x = torch.as_tensor(frame).to(device)
+        if x.dtype == torch.uint8:
+            x = x.to(torch.float32) / torch.tensor(255.0, dtype=torch.float32, device=device)
+        chw = x.permute(2, 0, 1).contiguous()
+        height, width = int(chw.shape[1]), int(chw.shape[2])
+        res = int(model.model.resolution)
+        batch = tvf.resize(chw, [res, res], antialias=False)[None]
+        out = self._engine(tvf.normalize(batch, model.means, model.stds))
+        predictions = {
+            "pred_boxes": out["dets"],
+            "pred_logits": out["labels"],
+            "pred_masks": out["masks"],
+        }
+        result = model.model.postprocess(
+            predictions,
+            target_sizes=torch.tensor([[height, width]], device=device),
+            score_threshold=self.threshold,
+        )[0]
+        keep = result["scores"] > self.threshold
+        boxes = result["boxes"][keep].float().cpu().tolist()
+        scores = result["scores"][keep].float().cpu().tolist()
+        labels = result["labels"][keep].cpu().tolist()
+        masks = result["masks"][keep].squeeze(1) if "masks" in result else None
+        return [
+            (*boxes[j], scores[j], int(labels[j]), masks[j] if masks is not None else None)
+            for j in range(len(scores))
+        ]
 
     def forward(
         self,
@@ -507,7 +637,7 @@ class RFDETRSegmenter(Node):
         """Max-paste one instance (mask if present, else its box) into the canvas."""
         h, w = canvas.shape
         if inst_mask is not None:
-            m = torch.as_tensor(inst_mask, dtype=torch.bool)
+            m = torch.as_tensor(inst_mask, dtype=torch.bool, device=canvas.device)
             rows = min(m.shape[0], h - r0)
             if rows <= 0:
                 return
