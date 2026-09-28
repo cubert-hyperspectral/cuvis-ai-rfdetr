@@ -14,6 +14,7 @@ from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
 from torch import Tensor
 
+from cuvis_ai_rfdetr._compat import base_kwargs
 from cuvis_ai_rfdetr.functional import compute_multi_scale_scales, targets_from_mask
 
 #: Detection tier (Apache-2.0 sizes only — XL/2XL detection is platform-licensed).
@@ -99,7 +100,8 @@ class RFDETRTrainable(Node):
             shape=(-1, -1, -1),
             optional=True,
             description="Integer class/instance mask [B, H, W], 0 = background. "
-            "Connected components become DETR targets (single FO class). "
+            "Connected components become DETR targets — one FO class by default, or "
+            "per-class labels (id - 1) when multiclass_targets=True. "
             "Required in TRAIN (denoising queries need targets).",
         ),
         # The executor injects the Context as a call-site kwarg to every node
@@ -134,6 +136,7 @@ class RFDETRTrainable(Node):
         resolution: int | None = None,
         num_channels: int = 3,
         checkpoint_loader: str = "constructor",
+        multiclass_targets: bool = False,
         **kwargs: Any,
     ) -> None:
         variant_key = str(variant).lower()
@@ -171,11 +174,10 @@ class RFDETRTrainable(Node):
         self.resolution = resolution
         self.num_channels = num_channels
         self.checkpoint_loader = checkpoint_loader
+        self.multiclass_targets = bool(multiclass_targets)
 
-        name, execution_stages = Node.consume_base_kwargs(kwargs)
         super().__init__(
-            name=name,
-            execution_stages=execution_stages,
+            **base_kwargs(kwargs),
             dataset_dir=self.dataset_dir,
             checkpoint_path=self.checkpoint_path,
             variant=self.variant,
@@ -183,6 +185,7 @@ class RFDETRTrainable(Node):
             resolution=self.resolution,
             num_channels=self.num_channels,
             checkpoint_loader=self.checkpoint_loader,
+            multiclass_targets=self.multiclass_targets,
             **kwargs,
         )
 
@@ -398,7 +401,9 @@ class RFDETRTrainable(Node):
 
         targets: list[dict[str, Tensor]] = []
         if targets_mask is not None:
-            targets = targets_from_mask(targets_mask, with_masks=self.segmentation)
+            targets = targets_from_mask(
+                targets_mask, with_masks=self.segmentation, multiclass=self.multiclass_targets
+            )
             targets = [{k: v.to(x.device) for k, v in t.items()} for t in targets]
 
         if (stage == ExecutionStage.TRAIN or self.training) and targets_mask is None:

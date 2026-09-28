@@ -1,7 +1,7 @@
 # Local plugin manifest (path resolved relative to this file).
 # For released consumers, switch to the git source instead:
 #   repo: "https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git"
-#   tag: "v0.1.0"
+#   tag: "v0.5.0"   # first release with the walnut deploy nodes
 name: rfdetr
 path: "."
 capabilities:
@@ -10,3 +10,9 @@ capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable
   - class_name: cuvis_ai_rfdetr.node.rfdetr_loss.RFDETRCriterionLoss
   - class_name: cuvis_ai_rfdetr.node.percentile_composite.PercentileComposite
+  - class_name: cuvis_ai_rfdetr.node.scalar_minmax_bandslice.ScalarMinMaxBandSlice
+  - class_name: cuvis_ai_rfdetr.node.score_intersection.ScoreIntersection
+  - class_name: cuvis_ai_rfdetr.node.score_fusion.ScoreFusion
+  - class_name: cuvis_ai_rfdetr.node.fixed_pca_projection.FixedPCAProjection
+  - class_name: cuvis_ai_rfdetr.node.carl_segmenter.CarlSegmenter
+  - class_name: cuvis_ai_rfdetr.node.sam_shell_gate.SamShellGate
