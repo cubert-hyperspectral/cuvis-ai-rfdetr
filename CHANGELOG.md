@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-28
+
 ### Added
 - `tensorrt` extra for the TensorRT backend: `tensorrt-cu13==10.15.1.29` on Linux aarch64 (Jetson Thor-class,
   CUDA 13 torch), `tensorrt-cu12==10.15.1.29` on Windows and Linux x86_64 (CUDA 12 torch), plus `onnx` for

@@ -31,7 +31,7 @@ this package. See `NOTICE` for attribution.
 ## Install
 
 ```bash
-pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.5.0"
+pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.5.1"
 ```
 
 Dependencies pull in the RF-DETR **core (inference) tier** only. The `rfdetr`
@@ -271,7 +271,7 @@ nodes. Released consumers should pin the git source instead (the nodes after
 ```yaml
 name: rfdetr
 repo: "https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git"
-tag: "v0.5.0"
+tag: "v0.5.1"
 package_name: cuvis-ai-rfdetr
 capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_detector.RFDETRDetector
