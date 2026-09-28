@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+- `tensorrt` extra for the TensorRT backend: `tensorrt-cu13==10.15.1.29` on Linux aarch64 (Jetson Thor-class,
+  CUDA 13 torch), `tensorrt-cu12==10.15.1.29` on Windows and Linux x86_64 (CUDA 12 torch), plus `onnx` for
+  building engines. Pinned to TensorRT 10 (TensorRT 11 dropped the FP16 builder flag); engines are tied to the
+  TensorRT version. cuvis.next does not install extras of node plugins yet (cuvis-ai-core#89, #19).
+
 ## [0.5.0] - 2026-09-28
 
 ### Added

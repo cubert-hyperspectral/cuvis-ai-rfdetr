@@ -140,10 +140,28 @@ a `.json` build record next to it. The node refuses an engine whose record
 names a different checkpoint, and a missing engine fails with the exact
 build command.
 
-TensorRT and `onnx` (needed for building) are not plugin dependencies,
-because the right wheel depends on torch's CUDA. Install `tensorrt-cu12` for
-a CUDA 12 torch or `tensorrt-cu13` for a CUDA 13 torch, version 10.x, plus
-`onnx`.
+TensorRT and `onnx` (needed for building) come with the optional
+`tensorrt` extra, not with the base install:
+
+```bash
+pip install "cuvis-ai-rfdetr[tensorrt] @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@<tag>"
+```
+
+The extra pins TensorRT 10.15.1.29. The wheel has to match torch's CUDA,
+and the extra picks it by platform: `tensorrt-cu13` on Linux aarch64
+(Jetson Thor-class, CUDA 13 torch), `tensorrt-cu12` on Windows and
+Linux x86_64 (CUDA 12 torch). The aarch64 wheels need glibc 2.35 or newer
+(Ubuntu 22.04+). On a Jetson with CUDA 12 (JetPack 6), use JetPack's own
+TensorRT instead of the extra. On other combinations, install the matching
+`tensorrt-cu12` / `tensorrt-cu13` 10.x wheel yourself. TensorRT 11 no longer
+builds fp16 engines. The PyPI `-libs` packages download the real wheel
+(~2 GB) from https://pypi.nvidia.com at install time.
+
+cuvis.next's composed environments install only the base dependencies of
+node plugins, not their extras (cuvis-ai-core#89). Until that changes,
+install TensorRT into the composed environment by hand. That install is
+lost when the environment is composed anew, e.g. after a cuvis.next update
+or a change to this plugin's `pyproject.toml`.
 
 Example: RF-DETR-Seg-L at 504 px on a Jetson AGX Thor. The network takes
 29 ms in PyTorch fp32, 20 ms as a TensorRT fp32 engine and 6 ms as a TensorRT
