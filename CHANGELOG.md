@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-28
+
 ### Added
 - `RFDETRSegmenter` TensorRT backend: `backend="tensorrt"` runs a TensorRT engine compiled from the network (via
   rfdetr's own ONNX export) in place of the PyTorch network, with rfdetr's pre- and post-processing unchanged

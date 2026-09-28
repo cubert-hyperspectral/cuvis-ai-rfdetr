@@ -31,7 +31,7 @@ this package. See `NOTICE` for attribution.
 ## Install
 
 ```bash
-pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.4.0"
+pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.5.0"
 ```
 
 Dependencies pull in the RF-DETR **core (inference) tier** only. The `rfdetr`
@@ -248,8 +248,7 @@ error.
 
 The repository root ships a local-path manifest (`plugins.yaml`) exposing all
 nodes. Released consumers should pin the git source instead (the nodes after
-`PercentileComposite` ship from the first release after v0.4.0; until it is
-tagged, use the local-path manifest):
+`PercentileComposite` ship from v0.5.0):
 
 ```yaml
 name: rfdetr
