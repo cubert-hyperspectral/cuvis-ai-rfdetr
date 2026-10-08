@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from cuvis_ai_rfdetr._compat import base_kwargs
 from cuvis_ai_rfdetr.training import EmaCallback
 
 try:  # rfdetr.training pulls the full train stack (faster_coco_eval, ...)
@@ -275,8 +276,7 @@ def test_integration_fit_with_ema_and_param_groups(tmp_path) -> None:
         OUTPUT_SPECS = {"pred": PortSpec(dtype=torch.float32, shape=(-1, -1))}
 
         def __init__(self, **kwargs):
-            name, stages = Node.consume_base_kwargs(kwargs)
-            super().__init__(name=name, execution_stages=stages, **kwargs)
+            super().__init__(**base_kwargs(kwargs), **kwargs)
             self.model = torch.nn.Linear(4, 2)
 
         def unfreeze(self):
@@ -299,8 +299,7 @@ def test_integration_fit_with_ema_and_param_groups(tmp_path) -> None:
         OUTPUT_SPECS = {"loss": PortSpec(dtype=torch.float32, shape=())}
 
         def __init__(self, **kwargs):
-            name, stages = Node.consume_base_kwargs(kwargs)
-            super().__init__(name=name, execution_stages=stages, **kwargs)
+            super().__init__(**base_kwargs(kwargs), **kwargs)
 
         def forward(self, pred, target, context=None, **_):
             return {"loss": torch.nn.functional.mse_loss(pred, target)}

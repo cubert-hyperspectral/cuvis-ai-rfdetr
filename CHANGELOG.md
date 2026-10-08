@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-08
+
+### Added
+- `RFDETRSegmenter.prepare_inference()` (the cuvis-ai-core 0.18.2 hook): with `backend="tensorrt"` it loads the
+  engine when the pipeline loads and builds a missing one on the machine itself, so a TensorRT pipeline runs in
+  CuvisNEXT without a hand-built engine. The build holds a file lock per engine (concurrent loads build once),
+  writes the engine and its build record under temporary names and moves the record and then the engine into
+  place, and logs start and end. A failed build raises one error that names the manual build command. Later
+  calls (after a weights load) find the engine loaded and do nothing; without a CUDA device nothing is prepared
+  and a CPU-only machine can still load the pipeline. The torch backend has nothing to prepare.
+- Engine folders keyed by the weights: a new engine goes to `<checkpoint>.trt/<fingerprint>/` (the first 16 hex
+  digits of the checkpoint MD5, so retrained weights saved under the same name get their own engines), or, when
+  that folder is not writable, to `<model cache>/trt_engines/cuvis_ai_rfdetr/<fingerprint>/` in the cuvis-ai model
+  cache (`$CUVIS_MODEL_CACHE_DIR`). The `build` CLI uses the same folders. `trt_engine` gains `engine_location`,
+  `find_engine`, `build_missing_engine`, `weights_fingerprint`, `checkpoint_md5` (cached per path, size and
+  modification time) and `cache_engine_root`.
+
+### Changed
+- Requires `cuvis-ai-core>=0.18.2` (was 0.11.2) and declares `filelock` and `loguru` (both already core
+  dependencies). The lock moves to core 0.18.2 and schemas 0.14.1.
+- A missing engine is built instead of raising `FileNotFoundError`; that error remains only when there is no
+  checkpoint file to build from. Engines of 0.5.1, directly in `<checkpoint>.trt/` or `engine_dir`, still load
+  without a build, and an engine whose record names another checkpoint is still refused.
+
+### Fixed
+- Test helpers in `tests/test_integration_collab.py` and `tests/test_training_extras.py` construct their nodes
+  through `_compat.base_kwargs`, so they run on cuvis-ai-core 0.15 and later.
+
+### Tests
+- `tests/test_segmenter_tensorrt_characterization.py` pins the 0.5.1 lookup (an existing engine loads without a
+  build, another checkpoint's engine is refused, the torch backend never touches TensorRT);
+  `tests/test_segmenter_tensorrt_build.py` covers the build at load: folder layout and order, model cache
+  fallback, one build for concurrent loads, the error that names the command, the CLI and the atomic write; a
+  `slow` test builds a real engine of a tiny network through `prepare_inference` and loads it again without a
+  build.
+
 ## [0.5.1] - 2026-09-28
 
 ### Added

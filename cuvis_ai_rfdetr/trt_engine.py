@@ -7,6 +7,16 @@ resolution, the GPU and the TensorRT version, and one engine directory can hold 
 side (``<checkpoint>.trt/fp16_r504_NVIDIA-Thor-sm110_trt10.15.1.29.engine``, ...). A JSON file next to each engine
 records how it was built, including the checksum of the checkpoint it was built from.
 
+Where engines live: next to their checkpoint by default, in ``<checkpoint>.trt/<fingerprint>/``, where the
+fingerprint is the start of the checkpoint's MD5, so retrained weights saved under the same name get their own
+engines. When that folder cannot be written: ``<model cache>/trt_engines/cuvis_ai_rfdetr/<fingerprint>/`` (the
+cuvis-ai model cache, ``$CUVIS_MODEL_CACHE_DIR``). An explicit ``engine_dir`` takes the place of ``<checkpoint>.trt``.
+Engines of 0.5.1 and earlier, directly in ``<checkpoint>.trt/`` (or ``engine_dir``), are still found.
+
+A pipeline loader builds a missing engine on the machine itself (``RFDETRSegmenter.prepare_inference``, the
+cuvis-ai-core 0.18.2 hook): once per checkpoint, precision and GPU, under a file lock per engine, so concurrent loads
+build it once.
+
 Precision: ``fp32`` is TensorRT's default float build, which allows TF32 tensor-core math - like PyTorch after
 ``import rfdetr``, which sets ``torch.set_float32_matmul_precision("high")``. ``fp16`` sets TensorRT's FP16 builder
 flag (mixed precision: TensorRT keeps a layer in fp32 where that is faster or needed); TensorRT 11 dropped that flag,
@@ -31,13 +41,22 @@ import os
 import re
 import tempfile
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import torch
+from loguru import logger
 from torch import Tensor
 
 PRECISIONS = ("fp32", "fp16")
+#: Hex digits of the checkpoint MD5 that name its engine folder.
+FINGERPRINT_CHARS = 16
+#: Seconds a load waits for another process that builds the same engine (a build takes minutes).
+LOCK_TIMEOUT_S = 1800.0
 _LOGGER: Any = None
+#: Full MD5 per (absolute path, size, modification time): a pipeline that is prepared again does not
+#: re-read its checkpoint.
+_MD5_CACHE: dict[tuple[str, int, int], str] = {}
 
 
 def _tensorrt() -> Any:
@@ -95,6 +114,31 @@ def file_md5(path: str, chunk: int = 1 << 22) -> str:
     return digest.hexdigest()
 
 
+def checkpoint_md5(path: str) -> str:
+    """:func:`file_md5` of a checkpoint, computed once per path, size and modification time."""
+    st = os.stat(path)
+    key = (os.path.abspath(path), st.st_size, st.st_mtime_ns)
+    if key not in _MD5_CACHE:
+        _MD5_CACHE[key] = file_md5(path)
+    return _MD5_CACHE[key]
+
+
+def weights_fingerprint(checkpoint_path: str) -> str:
+    """Name of a checkpoint's engine folder: the first :data:`FINGERPRINT_CHARS` hex digits of its MD5."""
+    return checkpoint_md5(checkpoint_path)[:FINGERPRINT_CHARS]
+
+
+def cache_engine_root() -> str:
+    """Engine folders of checkpoints whose own folder is not writable.
+
+    ``<model cache>/trt_engines/cuvis_ai_rfdetr``, in the cuvis-ai model cache: ``$CUVIS_MODEL_CACHE_DIR`` (which the
+    CuvisNEXT runtime sets for its child environments), else ``~/.cuvis_runs/model_cache``.
+    """
+    from cuvis_ai_core.orchestrator.model_cache import model_cache_dir
+
+    return os.path.join(str(model_cache_dir()), "trt_engines", "cuvis_ai_rfdetr")
+
+
 def check_engine_matches(engine_path: str, checkpoint_path: str | None) -> None:
     """Refuse an engine whose build record says it was compiled from a different checkpoint."""
     record_path = f"{engine_path}.json"
@@ -102,11 +146,122 @@ def check_engine_matches(engine_path: str, checkpoint_path: str | None) -> None:
         return
     with open(record_path, encoding="utf-8") as f:
         built_from = json.load(f).get("checkpoint_md5")
-    if built_from and built_from != file_md5(checkpoint_path):
+    if built_from and built_from != checkpoint_md5(checkpoint_path):
         raise RuntimeError(
             f"TensorRT engine {engine_path} was built from a different checkpoint than "
-            f"{checkpoint_path}; rebuild it (python -m cuvis_ai_rfdetr.trt_engine build ... --force)."
+            f"{checkpoint_path}; rebuild it (python -m cuvis_ai_rfdetr.trt_engine build ... --force) "
+            "or delete it."
         )
+
+
+@dataclass(frozen=True)
+class EngineLocation:
+    """Where one engine is looked up, and where a missing one is built.
+
+    ``candidates``, in lookup order: the fingerprint folder, the 0.5.1 location directly in the engine folder, the
+    fingerprint folder in the model cache. ``build_dirs``: the fingerprint folder, then the one in the model cache;
+    a build goes to the first that is writable. Without a checkpoint there is nothing to fingerprint: only the engine
+    folder itself is searched, and nothing is built; the same when the checkpoint file does not exist.
+    """
+
+    candidates: tuple[str, ...]
+    build_dirs: tuple[str, ...]
+
+
+def engine_location(
+    file_name: str, checkpoint_path: str | None, engine_dir: str | None = None
+) -> EngineLocation:
+    """The :class:`EngineLocation` of the engine ``file_name`` for a checkpoint and an optional ``engine_dir``."""
+    base = engine_dir or default_engine_dir(checkpoint_path)
+    if checkpoint_path is None or not os.path.isfile(checkpoint_path):
+        return EngineLocation(candidates=(os.path.join(base, file_name),), build_dirs=())
+    key = weights_fingerprint(checkpoint_path)
+    keyed = os.path.join(base, key)
+    cached = os.path.join(cache_engine_root(), key)
+    return EngineLocation(
+        candidates=(
+            os.path.join(keyed, file_name),
+            os.path.join(base, file_name),
+            os.path.join(cached, file_name),
+        ),
+        build_dirs=(keyed, cached),
+    )
+
+
+def find_engine(
+    file_name: str, checkpoint_path: str | None, engine_dir: str | None = None
+) -> str | None:
+    """The first existing engine of :func:`engine_location`, checked against its checkpoint; ``None`` if none.
+
+    An engine whose build record names another checkpoint is refused (:func:`check_engine_matches`), not skipped.
+    """
+    for path in engine_location(file_name, checkpoint_path, engine_dir).candidates:
+        if os.path.exists(path):
+            check_engine_matches(path, checkpoint_path)
+            return path
+    return None
+
+
+def _not_writable(folder: str) -> str | None:
+    """``None`` when ``folder`` exists (or can be created) and takes a new file, else why it does not."""
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with tempfile.TemporaryFile(dir=folder):
+            pass
+    except OSError as exc:
+        return f"{folder}: {exc}"
+    return None
+
+
+def build_missing_engine(
+    model: Any,
+    precision: str,
+    file_name: str,
+    *,
+    checkpoint_path: str,
+    engine_dir: str | None = None,
+    variant: str | None = None,
+    force: bool = False,
+) -> str:
+    """Build the engine ``file_name`` where :func:`find_engine` looks first, unless another process already has.
+
+    The build runs in the first writable folder of :func:`engine_location`, under a file lock per engine
+    (``<engine>.lock``): a second process that needs the same engine waits for the first and then loads its result.
+    Start and end are logged. ``force`` rebuilds even when an engine exists. Returns the engine path.
+    """
+    from filelock import FileLock, Timeout
+
+    location = engine_location(file_name, checkpoint_path, engine_dir)
+    reasons = []
+    for folder in location.build_dirs:
+        reason = _not_writable(folder)
+        if reason is not None:
+            reasons.append(reason)
+            continue
+        path = os.path.join(folder, file_name)
+        try:
+            with FileLock(f"{path}.lock", timeout=LOCK_TIMEOUT_S):
+                if not force:  # built by another process while this one waited for the lock
+                    found = find_engine(file_name, checkpoint_path, engine_dir)
+                    if found is not None:
+                        return found
+                logger.info(
+                    f"Building TensorRT engine {path} from {checkpoint_path} ({precision}); this "
+                    "takes a few minutes, once per checkpoint, precision and GPU."
+                )
+                record = build_engine(
+                    model, precision, path, checkpoint_path=checkpoint_path, variant=variant
+                )
+                logger.info(f"Built TensorRT engine {path} in {record['build_seconds']} s.")
+                return path
+        except Timeout as exc:
+            raise RuntimeError(
+                f"waited {LOCK_TIMEOUT_S:.0f} s for another process that builds {path} "
+                f"(lock file {path}.lock)"
+            ) from exc
+    raise PermissionError(
+        "no writable folder for the TensorRT engine: " + "; ".join(reasons or ["no checkpoint"])
+    )
 
 
 def export_onnx(model: Any, output_dir: str) -> str:
@@ -163,9 +318,6 @@ def build_engine(
         blob = builder.build_serialized_network(network, config)
     if blob is None:
         raise RuntimeError(f"TensorRT engine build failed ({precision}).")
-    os.makedirs(os.path.dirname(os.path.abspath(engine_path)), exist_ok=True)
-    with open(engine_path, "wb") as f:
-        f.write(blob)
     have_checkpoint = checkpoint_path is not None and os.path.exists(checkpoint_path)
     record = {
         "engine": os.path.basename(engine_path),
@@ -174,7 +326,7 @@ def build_engine(
         "resolution": int(model.model.resolution),
         "variant": variant,
         "checkpoint": checkpoint_path,
-        "checkpoint_md5": file_md5(checkpoint_path) if have_checkpoint else None,
+        "checkpoint_md5": checkpoint_md5(checkpoint_path) if have_checkpoint else None,
         "tensorrt": trt.__version__,
         "torch": torch.__version__,
         "rfdetr": _version("rfdetr"),
@@ -183,9 +335,32 @@ def build_engine(
         "build_seconds": round(time.perf_counter() - t0, 1),
         "built_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
-    with open(f"{engine_path}.json", "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=1)
+    _write_engine_and_record(engine_path, blob, record)
     return record
+
+
+def _write_engine_and_record(engine_path: str, blob: Any, record: dict[str, Any]) -> None:
+    """Write both files under temporary names next to their target, then move the record and last the engine.
+
+    A half-written engine is never visible under its name, and a visible engine always has its record.
+    """
+    folder = os.path.dirname(os.path.abspath(engine_path))
+    os.makedirs(folder, exist_ok=True)
+    stem = os.path.basename(engine_path)
+    contents = ((".json", json.dumps(record, indent=1).encode("utf-8")), ("", blob))
+    moves: list[tuple[str, str]] = []
+    try:
+        for suffix, data in contents:
+            fd, tmp = tempfile.mkstemp(dir=folder, prefix=f"{stem}{suffix}.", suffix=".tmp")
+            moves.append((tmp, f"{engine_path}{suffix}"))
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        for tmp, final in moves:  # the record first, the engine last
+            os.replace(tmp, final)
+    finally:
+        for tmp, _ in moves:
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
 
 class TensorRTEngine:
@@ -272,13 +447,22 @@ def _build_one(
         resolution=resolution,
         checkpoint_loader=checkpoint_loader,
     )._build_model()
-    engine_dir = engine_dir or default_engine_dir(checkpoint)
-    path = os.path.join(engine_dir, engine_file_name(precision, int(model.model.resolution)))
-    if os.path.exists(path) and not force:
-        print(f"exists: {path}", flush=True)
-        return path
-    record = build_engine(model, precision, path, checkpoint_path=checkpoint, variant=variant)
-    print(f"built: {path} ({record['build_seconds']} s)", flush=True)
+    name = engine_file_name(precision, int(model.model.resolution))
+    if not force:
+        found = find_engine(name, checkpoint, engine_dir)
+        if found is not None:
+            print(f"exists: {found}", flush=True)
+            return found
+    path = build_missing_engine(
+        model,
+        precision,
+        name,
+        checkpoint_path=checkpoint,
+        engine_dir=engine_dir,
+        variant=variant,
+        force=force,
+    )
+    print(f"built: {path}", flush=True)
     return path
 
 
@@ -325,7 +509,11 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help="repeatable; default: fp32 and fp16",
     )
-    one.add_argument("--engine-dir", default=None, help="default: <checkpoint>.trt/")
+    one.add_argument(
+        "--engine-dir",
+        default=None,
+        help="default: <checkpoint>.trt/ (the engine goes into its <fingerprint>/ subfolder)",
+    )
     one.add_argument("--force", action="store_true", help="rebuild an existing engine")
     pipe = sub.add_parser(
         "build-pipeline",
