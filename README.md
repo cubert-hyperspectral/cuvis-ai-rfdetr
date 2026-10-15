@@ -124,7 +124,7 @@ so everything after the network (`tiling`, `class_filter`, paste, NMS,
 | `engine_dir` | `None` | Where the engines are kept; `None` means `<checkpoint_path>.trt/`. Each checkpoint's engines go into a subfolder named after its fingerprint. |
 
 An engine only runs on the GPU and the TensorRT version it was built with,
-so it is built once per machine. With cuvis-ai-core 0.18.2 or later the
+so it is built once per machine. With cuvis-ai-core 0.18.5 or later the
 node builds a missing engine itself when the pipeline loads
 (`prepare_inference`, called by `restore-pipeline`, `LoadPipeline` and
 `LoadPipelineWeights` once the pipeline sits on its device). The build takes
@@ -132,7 +132,9 @@ a few minutes and happens once per checkpoint, precision and GPU; it is
 logged at start and end. Concurrent loads of the same engine wait for one
 build (a file lock per engine), and a failed build raises one error that
 names the manual command. The network is exported with rfdetr's own ONNX
-exporter and compiled with the TensorRT Python API. To build ahead of time:
+exporter and compiled with the TensorRT Python API; the folders, the lock
+and the build record follow cuvis-ai-core's `utils.trt_engine`, which every
+TensorRT node shares. To build ahead of time:
 
 ```bash
 python -m cuvis_ai_rfdetr.trt_engine build-pipeline pipeline.yaml   # every backend: tensorrt segmenter
@@ -146,11 +148,11 @@ goes to `<checkpoint_path>.trt/<fingerprint>/` (or `<engine_dir>/<fingerprint>/`
 where the fingerprint is the first 16 hex digits of the checkpoint's MD5, so
 retrained weights saved under the same name get their own engines. When
 that folder is not writable, the engine goes to the cuvis-ai model cache:
-`<model cache>/trt_engines/cuvis_ai_rfdetr/<fingerprint>/`, where the model
+`<model cache>/trt_engines/rfdetr/<fingerprint>/`, where the model
 cache is `$CUVIS_MODEL_CACHE_DIR` (set by the CuvisNEXT runtime) or
 `~/.cuvis_runs/model_cache`. The lookup tries the fingerprint folder, then
 the 0.5.1 location directly in `<checkpoint_path>.trt/` (or `engine_dir`),
-then the model cache. Each engine has a `.json` build record next to it.
+then the model cache (the fingerprint folder and the flat one). Each engine has a `.json` build record next to it.
 The node refuses an engine whose record names a different checkpoint; run
 the `build` command with `--force` (it builds into the fingerprint folder)
 or delete the old engine. Without a CUDA device the loader skips the engine,

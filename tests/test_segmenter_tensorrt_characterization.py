@@ -31,7 +31,7 @@ def _model(device: str = "cuda") -> SimpleNamespace:
 
 
 class _LoadedEngine:
-    def __init__(self, path, device):
+    def __init__(self, path, device, **_):
         self.path, self.device, self.input_shape = path, device, (1, 3, 8, 8)
 
 
@@ -43,7 +43,7 @@ def _isolated(monkeypatch, tmp_path):
         "engine_file_name",
         lambda precision, resolution, device=None: f"{precision}_r{resolution}.engine",
     )
-    monkeypatch.setattr(trt_engine, "build_engine", _fail)
+    monkeypatch.setattr(trt_engine, "compile_network", _fail)
     monkeypatch.setenv("CUVIS_MODEL_CACHE_DIR", str(tmp_path / "model_cache"))
 
 
@@ -83,7 +83,7 @@ def test_engine_built_from_another_checkpoint_is_refused(monkeypatch, tmp_path) 
     monkeypatch.setattr(node, "_build_model", _model)
     monkeypatch.setattr(trt_engine, "TensorRTEngine", _fail)
 
-    with pytest.raises(RuntimeError, match="different checkpoint"):
+    with pytest.raises(RuntimeError, match="other weights"):
         node._ensure_model()
     assert node._model is None and node._engine is None
     assert sorted(p.name for p in folder.iterdir()) == ["fp32_r8.engine", "fp32_r8.engine.json"]

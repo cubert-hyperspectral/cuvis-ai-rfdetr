@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 import torch
 import torchvision.transforms.functional as tvf
+from cuvis_ai_core.utils import trt_engine as core_trt
 
 from cuvis_ai_rfdetr import trt_engine
 from cuvis_ai_rfdetr.functional import to_uint8_frames
@@ -228,7 +229,7 @@ def test_backend_hparams_defaults_round_trip_and_validation() -> None:
 
 
 class _LoadedEngine:
-    def __init__(self, path, device, input_shape=(1, 3, 8, 8)):
+    def __init__(self, path, device, input_shape=(1, 3, 8, 8), **_):
         self.path, self.device, self.input_shape = path, device, input_shape
 
 
@@ -281,7 +282,7 @@ def test_engine_with_the_wrong_input_shape_is_refused(monkeypatch, tmp_path):
     (tmp_path / "fp32_r8.engine").write_bytes(b"engine")
     node = RFDETRSegmenter(backend="tensorrt", engine_dir=str(tmp_path))
     monkeypatch.setattr(node, "_build_model", lambda: FakeTRTModel([], device="cuda"))
-    _patch_engine_lookup(monkeypatch, lambda p, d: _LoadedEngine(p, d, (1, 3, 16, 16)))
+    _patch_engine_lookup(monkeypatch, lambda p, d, **_: _LoadedEngine(p, d, (1, 3, 16, 16)))
     with pytest.raises(RuntimeError, match="rebuild"):
         node._ensure_model()
 
@@ -341,7 +342,7 @@ def _fake_tensorrt(monkeypatch, version="10.15.1.29", fp16_flag=True, parse_ok=T
 
     trt.Builder, trt.OnnxParser = Builder, Parser
     monkeypatch.setitem(sys.modules, "tensorrt", trt)
-    monkeypatch.setattr(trt_engine, "_LOGGER", None)
+    monkeypatch.setattr(core_trt, "_LOGGER", None)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "NVIDIA Thor (x)")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (11, 0))
     return trt
@@ -430,7 +431,7 @@ def test_engine_built_from_another_checkpoint_is_refused(tmp_path) -> None:
     engine = tmp_path / "e.engine"
     trt_engine.check_engine_matches(str(engine), str(checkpoint))  # no record: accepted
     (tmp_path / "e.engine.json").write_text(json.dumps({"checkpoint_md5": "0" * 32}))
-    with pytest.raises(RuntimeError, match="different checkpoint"):
+    with pytest.raises(RuntimeError, match="other weights"):
         trt_engine.check_engine_matches(str(engine), str(checkpoint))
     md5 = trt_engine.file_md5(str(checkpoint))
     (tmp_path / "e.engine.json").write_text(json.dumps({"checkpoint_md5": md5}))

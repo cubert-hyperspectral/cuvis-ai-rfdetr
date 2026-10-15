@@ -409,7 +409,9 @@ class RFDETRSegmenter(Node):
         path = trt_engine.find_engine(name, self.checkpoint_path, self.engine_dir)
         if path is None:
             path = self._build_engine(model, name, resolution)
-        engine = trt_engine.TensorRTEngine(path, device)
+        engine = trt_engine.TensorRTEngine(
+            path, device, rebuild_hint=f"Rebuild it with: {self._build_command(resolution)} --force"
+        )
         expected = (1, 3, resolution, resolution)
         if tuple(engine.input_shape) != expected:
             raise RuntimeError(
@@ -420,15 +422,16 @@ class RFDETRSegmenter(Node):
 
     def _build_command(self, resolution: int) -> str:
         """The command that builds this node's engine by hand."""
-        command = (
-            f"python -m cuvis_ai_rfdetr.trt_engine build --checkpoint {self.checkpoint_path} "
-            f"--variant {self.variant} --resolution {resolution} --precision {self.precision}"
+        from cuvis_ai_rfdetr import trt_engine
+
+        return trt_engine.build_command(
+            self.checkpoint_path,
+            self.variant,
+            resolution,
+            self.precision,
+            checkpoint_loader=self.checkpoint_loader,
+            engine_dir=self.engine_dir,
         )
-        if self.checkpoint_loader != "constructor":
-            command += f" --checkpoint-loader {self.checkpoint_loader}"
-        if self.engine_dir:
-            command += f" --engine-dir {self.engine_dir}"
-        return command
 
     def _build_engine(self, model: Any, name: str, resolution: int) -> str:
         """Build the missing engine ``name`` from ``model``; one error naming the manual command if that fails."""
@@ -441,21 +444,17 @@ class RFDETRSegmenter(Node):
                 f"RFDETRSegmenter: no TensorRT engine {name} in {where}, and no checkpoint file "
                 f"to build one from ({self.checkpoint_path}). Build it once with: {command}"
             )
-        try:
-            return trt_engine.build_missing_engine(
-                model,
-                self.precision,
-                name,
-                checkpoint_path=self.checkpoint_path,
-                engine_dir=self.engine_dir,
-                variant=self.variant,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"RFDETRSegmenter: could not build the TensorRT engine {name} for "
-                f"{self.checkpoint_path} ({type(exc).__name__}: {exc}). Build it by hand with: "
-                f"{command}"
-            ) from exc
+        # cuvis-ai-core's build raises one error that names the command (failed build, no
+        # writable folder, a lock held too long)
+        return trt_engine.build_missing_engine(
+            model,
+            self.precision,
+            name,
+            checkpoint_path=self.checkpoint_path,
+            engine_dir=self.engine_dir,
+            variant=self.variant,
+            command=command,
+        )
 
     def _apply_inference_options(self, model: Any) -> Any:
         """Export / cast / trace the network per ``precision`` and ``jit_trace``.

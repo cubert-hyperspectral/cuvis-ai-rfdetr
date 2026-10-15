@@ -1,8 +1,8 @@
 """RFDETRSegmenter builds a missing TensorRT engine when the pipeline loads (``prepare_inference``).
 
-Mocked: no TensorRT, no rfdetr model and no GPU needed. ``build_engine`` is replaced by a fake that writes an engine
-and its record through the real atomic writer, so the lookup, the folder choice, the lock and the error paths run as
-in production.
+Mocked: no TensorRT, no rfdetr model and no GPU needed. ``compile_network`` is replaced by a fake that returns an
+engine and its record, which cuvis-ai-core's ``build_engine_once`` writes, so the lookup, the folder choice, the lock
+and the error paths run as in production. The fingerprint cache and the atomic writer are core's and tested there.
 """
 
 from __future__ import annotations
@@ -11,10 +11,12 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from cuvis_ai_core.utils import trt_engine as core_trt
 from loguru import logger
 
 from cuvis_ai_rfdetr import trt_engine
@@ -31,33 +33,30 @@ def _model(device: str = "cuda") -> SimpleNamespace:
 
 
 class _LoadedEngine:
-    def __init__(self, path, device):
+    def __init__(self, path, device, **_):
         self.path, self.device, self.input_shape = path, device, (1, 3, 8, 8)
 
 
 class FakeBuilds:
-    """``build_engine`` stand-in: counts builds and writes an engine plus its record like the real one."""
+    """``compile_network`` stand-in: counts builds and returns an engine plus its RF-DETR record."""
 
     def __init__(self, seconds: float = 0.0, error: Exception | None = None):
         self.paths: list[str] = []
         self.seconds, self.error = seconds, error
         self.lock = threading.Lock()
 
-    def __call__(self, model, precision, engine_path, *, checkpoint_path=None, variant=None):
+    def __call__(self, model, precision, *, checkpoint_path=None, variant=None):
         with self.lock:
-            self.paths.append(engine_path)
+            self.paths.append(precision)
         time.sleep(self.seconds)
         if self.error is not None:
             raise self.error
         record = {
-            "engine": os.path.basename(engine_path),
             "precision": precision,
             "checkpoint": checkpoint_path,
             "checkpoint_md5": trt_engine.checkpoint_md5(checkpoint_path),
-            "build_seconds": self.seconds,
         }
-        trt_engine._write_engine_and_record(engine_path, b"plan", record)
-        return record
+        return b"plan", record
 
 
 @pytest.fixture
@@ -75,7 +74,11 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(trt_engine, "TensorRTEngine", _LoadedEngine)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     builds = FakeBuilds()
-    monkeypatch.setattr(trt_engine, "build_engine", builds)
+    monkeypatch.setattr(trt_engine, "compile_network", builds)
+    # core's build adds the TensorRT, torch and GPU fields to the record
+    monkeypatch.setattr(core_trt, "import_tensorrt", lambda *a: SimpleNamespace(__version__="10.x"))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "GPU")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 9))
     messages: list[str] = []
     sink = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
     yield SimpleNamespace(
@@ -105,40 +108,28 @@ def _keyed(env, folder=None):
 
 
 # ------------------------------------------------------------------ lookup and layout
-def test_fingerprint_is_the_md5_prefix_read_once_per_file_version(monkeypatch, tmp_path) -> None:
-    checkpoint = tmp_path / "w.pth"
-    checkpoint.write_bytes(b"weights v1")
-    full = trt_engine.file_md5(str(checkpoint))
-    reads = []
-    real = trt_engine.file_md5
-    monkeypatch.setattr(trt_engine, "file_md5", lambda p: reads.append(p) or real(p))
-    assert trt_engine.weights_fingerprint(str(checkpoint)) == full[: trt_engine.FINGERPRINT_CHARS]
-    assert trt_engine.checkpoint_md5(str(checkpoint)) == full
-    assert len(reads) == 1  # cached
-    checkpoint.write_bytes(b"retrained weights")  # new size and modification time
-    assert trt_engine.weights_fingerprint(str(checkpoint)) != full[: trt_engine.FINGERPRINT_CHARS]
-    assert len(reads) == 2
-
-
 def test_engine_location_order(env) -> None:
     key = trt_engine.weights_fingerprint(str(env.checkpoint))
-    base = f"{env.checkpoint}.trt"
-    cache = os.path.join(str(env.cache), "trt_engines", "cuvis_ai_rfdetr", key)
+    base = Path(f"{env.checkpoint}.trt")
+    root = env.cache / "trt_engines" / "rfdetr"
     loc = trt_engine.engine_location("e.engine", str(env.checkpoint))
     assert loc.candidates == (
-        os.path.join(base, key, "e.engine"),
-        os.path.join(base, "e.engine"),
-        os.path.join(cache, "e.engine"),
+        base / key / "e.engine",
+        base / "e.engine",
+        root / key / "e.engine",
+        root / "e.engine",
     )
-    assert loc.build_dirs == (os.path.join(base, key), cache)
+    assert loc.build_dirs == (base / key, root / key)
     explicit = trt_engine.engine_location("e.engine", str(env.checkpoint), "/engines")
     assert explicit.candidates[:2] == (
-        os.path.join("/engines", key, "e.engine"),
-        os.path.join("/engines", "e.engine"),
+        Path("/engines") / key / "e.engine",
+        Path("/engines") / "e.engine",
     )
     for checkpoint in (None, str(env.checkpoint) + ".missing"):
         flat = trt_engine.engine_location("e.engine", checkpoint, "/engines")
-        assert flat == trt_engine.EngineLocation((os.path.join("/engines", "e.engine"),), ())
+        assert flat == trt_engine.EngineLocation(
+            (Path("/engines") / "e.engine", root / "e.engine"), ()
+        )
 
 
 def test_fingerprint_folder_wins_over_a_stale_engine_of_0_5_1(env, monkeypatch) -> None:
@@ -149,7 +140,7 @@ def test_fingerprint_folder_wins_over_a_stale_engine_of_0_5_1(env, monkeypatch) 
     with open(os.path.join(base, "fp16_r8.engine.json"), "w") as f:
         json.dump({"checkpoint_md5": "0" * 32}, f)
     node = _node(env, monkeypatch)
-    with pytest.raises(RuntimeError, match="different checkpoint"):
+    with pytest.raises(RuntimeError, match="other weights"):
         node.prepare_inference()  # refused, not silently rebuilt
     assert env.builds.paths == []
     # the fix the error names: a forced build, which goes to the fingerprint folder
@@ -167,7 +158,7 @@ def test_prepare_inference_builds_a_missing_engine_once(env, monkeypatch) -> Non
     node = _node(env, monkeypatch)
     node.prepare_inference()
     expected = os.path.join(_keyed(env), "fp16_r8.engine")
-    assert env.builds.paths == [expected]
+    assert env.builds.paths == ["fp16"]
     assert node._engine.path == expected
     with open(f"{expected}.json") as f:
         assert json.load(f)["checkpoint_md5"] == trt_engine.file_md5(str(env.checkpoint))
@@ -192,26 +183,26 @@ def test_prepare_inference_uses_the_explicit_engine_dir(env, monkeypatch, tmp_pa
 
 
 def test_unwritable_checkpoint_folder_falls_back_to_the_model_cache(env, monkeypatch) -> None:
-    real = trt_engine._not_writable
+    real = core_trt._not_writable
     keyed = _keyed(env)
     monkeypatch.setattr(
-        trt_engine,
+        core_trt,
         "_not_writable",
-        lambda folder: f"{folder}: read-only" if folder == keyed else real(folder),
+        lambda folder: f"{folder}: read-only" if str(folder) == keyed else real(folder),
     )
     node = _node(env, monkeypatch)
     node.prepare_inference()
     cached = os.path.join(
         str(env.cache),
         "trt_engines",
-        "cuvis_ai_rfdetr",
+        "rfdetr",
         trt_engine.weights_fingerprint(str(env.checkpoint)),
         "fp16_r8.engine",
     )
-    assert env.builds.paths == [cached] and node._engine.path == cached
+    assert env.builds.paths == ["fp16"] and node._engine.path == cached
     assert not os.path.exists(keyed)
 
-    monkeypatch.setattr(trt_engine, "_not_writable", real)  # the next load finds it without a build
+    monkeypatch.setattr(core_trt, "_not_writable", real)  # the next load finds it without a build
     fresh = _node(env, monkeypatch)
     fresh.prepare_inference()
     assert fresh._engine.path == cached and len(env.builds.paths) == 1
@@ -223,8 +214,8 @@ def test_failed_build_raises_one_error_that_names_the_command(env, monkeypatch) 
     with pytest.raises(RuntimeError) as err:
         node.prepare_inference()
     msg = str(err.value)
-    assert "could not build the TensorRT engine fp16_r8.engine" in msg
-    assert "RuntimeError: TensorRT engine build failed (fp16)." in msg
+    assert "could not build TensorRT engine" in msg and "fp16_r8.engine" in msg
+    assert "RuntimeError: TensorRT engine build failed (fp16).)" in msg
     assert (
         f"Build it by hand with: python -m cuvis_ai_rfdetr.trt_engine build --checkpoint "
         f"{env.checkpoint} --variant large --resolution 8 --precision fp16"
@@ -235,9 +226,9 @@ def test_failed_build_raises_one_error_that_names_the_command(env, monkeypatch) 
 
 
 def test_no_writable_folder_names_the_command(env, monkeypatch) -> None:
-    monkeypatch.setattr(trt_engine, "_not_writable", lambda folder: f"{folder}: read-only")
+    monkeypatch.setattr(core_trt, "_not_writable", lambda folder: f"{folder}: read-only")
     node = _node(env, monkeypatch)
-    with pytest.raises(RuntimeError, match="PermissionError: no writable folder") as err:
+    with pytest.raises(RuntimeError, match="no folder to build") as err:
         node.prepare_inference()
     assert "Build it by hand with: python -m cuvis_ai_rfdetr.trt_engine build" in str(err.value)
     assert env.builds.paths == []
@@ -286,19 +277,6 @@ def test_concurrent_loads_build_the_engine_once(env, monkeypatch) -> None:
 
 
 # ------------------------------------------------------------------ writing and the CLI
-def test_engine_and_record_are_written_as_one_unit(tmp_path) -> None:
-    path = tmp_path / "e.engine"
-    trt_engine._write_engine_and_record(str(path), b"plan", {"checkpoint_md5": "x"})
-    assert path.read_bytes() == b"plan"
-    assert json.loads((tmp_path / "e.engine.json").read_text()) == {"checkpoint_md5": "x"}
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["e.engine", "e.engine.json"]
-
-    broken = tmp_path / "broken.engine"
-    with pytest.raises(TypeError):  # the engine bytes cannot be written: nothing appears
-        trt_engine._write_engine_and_record(str(broken), object(), {"checkpoint_md5": "y"})
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["e.engine", "e.engine.json"]
-
-
 def test_cli_builds_into_the_fingerprint_folder_and_reports_existing_engines(
     env, monkeypatch, capsys
 ) -> None:
@@ -306,11 +284,11 @@ def test_cli_builds_into_the_fingerprint_folder_and_reports_existing_engines(
     args = ["build", "--checkpoint", str(env.checkpoint), "--precision", "fp16"]
     expected = os.path.join(_keyed(env), "fp16_r8.engine")
     assert trt_engine.main(args) == 0
-    assert env.builds.paths == [expected]
+    assert env.builds.paths == ["fp16"]
     assert trt_engine.main(args) == 0  # exists: nothing built
     assert len(env.builds.paths) == 1
     assert trt_engine.main([*args, "--force"]) == 0
-    assert env.builds.paths == [expected, expected]
+    assert env.builds.paths == ["fp16", "fp16"]
     out = capsys.readouterr().out
     assert f"built: {expected}" in out and f"exists: {expected}" in out
 
@@ -355,9 +333,9 @@ def test_real_engine_is_built_at_load_and_found_by_the_next_load(monkeypatch, tm
     checkpoint = tmp_path / "w.pth"
     checkpoint.write_bytes(b"tiny weights")
     builds = []
-    real_build = trt_engine.build_engine
+    real_compile = trt_engine.compile_network
     monkeypatch.setattr(
-        trt_engine, "build_engine", lambda *a, **k: builds.append(a[2]) or real_build(*a, **k)
+        trt_engine, "compile_network", lambda *a, **k: builds.append(1) or real_compile(*a, **k)
     )
 
     def node():
@@ -372,9 +350,10 @@ def test_real_engine_is_built_at_load_and_found_by_the_next_load(monkeypatch, tm
     second = node()
     second.prepare_inference()
     assert len(builds) == 1
-    assert first._engine.path == second._engine.path == builds[0]
-    assert os.path.dirname(builds[0]) == _keyed(SimpleNamespace(checkpoint=checkpoint))
-    with open(f"{builds[0]}.json") as f:
+    built = first._engine.path
+    assert second._engine.path == built
+    assert os.path.dirname(built) == _keyed(SimpleNamespace(checkpoint=checkpoint))
+    with open(f"{built}.json") as f:
         assert json.load(f)["checkpoint_md5"] == trt_engine.file_md5(str(checkpoint))
     x = torch.rand(1, 3, 16, 16, device="cuda")
     out = second._engine(x)
