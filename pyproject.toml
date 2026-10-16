@@ -40,7 +40,8 @@ keywords = [
 dependencies = [
     # Note: do NOT depend on the high-level `cuvis-ai` package — plugins target
     # cuvis-ai-core + cuvis-ai-schemas only (matching the sibling plugins).
-    # 0.18.2: Node.prepare_inference, where RFDETRSegmenter builds a missing TensorRT engine.
+    # 0.18.2 added Node.prepare_inference, where RFDETRSegmenter builds a missing TensorRT engine;
+    # 0.18.5 added utils.trt_engine, the engine rules the plugin runs on.
     "cuvis-ai-core>=0.18.5",
     "cuvis-ai-schemas>=0.8.0",
     # Official Roboflow RF-DETR, core (inference) tier only — deliberately NOT
