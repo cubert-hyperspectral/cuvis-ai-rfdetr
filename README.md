@@ -31,7 +31,7 @@ this package. See `NOTICE` for attribution.
 ## Install
 
 ```bash
-pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.5.1"
+pip install "cuvis-ai-rfdetr @ git+https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git@v0.5.2"
 ```
 
 Dependencies pull in the RF-DETR **core (inference) tier** only. The `rfdetr`
@@ -121,12 +121,20 @@ so everything after the network (`tiling`, `class_filter`, paste, NMS,
 | --- | --- | --- |
 | `backend` | `"torch"` | `"tensorrt"`: run this machine's TensorRT engine. Needs CUDA and the `tensorrt` package. `jit_trace` does not apply. |
 | `precision` | `"fp32"` | With `backend="tensorrt"` it selects the engine. `"fp32"` is TensorRT's default float build, which allows TF32 math like the PyTorch default after `import rfdetr`. `"fp16"` uses the FP16 builder flag, which needs TensorRT 10. |
-| `engine_dir` | `None` | Where the engines are kept; `None` means `<checkpoint_path>.trt/`. |
+| `engine_dir` | `None` | Where the engines are kept; `None` means `<checkpoint_path>.trt/`. Each checkpoint's engines go into a subfolder named after its fingerprint. |
 
 An engine only runs on the GPU and the TensorRT version it was built with,
-so it is built once per machine before the first run. The network is
-exported with rfdetr's own ONNX exporter and compiled with the TensorRT
-Python API:
+so it is built once per machine. With cuvis-ai-core 0.18.5 or later the
+node builds a missing engine itself when the pipeline loads
+(`prepare_inference`, called by `restore-pipeline`, `LoadPipeline` and
+`LoadPipelineWeights` once the pipeline sits on its device). The build takes
+a few minutes and happens once per checkpoint, precision and GPU; it is
+logged at start and end. Concurrent loads of the same engine wait for one
+build (a file lock per engine), and a failed build raises one error that
+names the manual command. The network is exported with rfdetr's own ONNX
+exporter and compiled with the TensorRT Python API; the folders, the lock
+and the build record follow cuvis-ai-core's `utils.trt_engine`, which every
+TensorRT node shares. To build ahead of time:
 
 ```bash
 python -m cuvis_ai_rfdetr.trt_engine build-pipeline pipeline.yaml   # every backend: tensorrt segmenter
@@ -135,10 +143,21 @@ python -m cuvis_ai_rfdetr.trt_engine build --checkpoint W.pth --variant large --
 
 Engine files are named
 `<precision>_r<resolution>_<GPU>-sm<capability>_trt<TensorRT version>.engine`,
-so the engines of several machines can share one directory. Each engine has
-a `.json` build record next to it. The node refuses an engine whose record
-names a different checkpoint, and a missing engine fails with the exact
-build command.
+so the engines of several machines can share one directory. A new engine
+goes to `<checkpoint_path>.trt/<fingerprint>/` (or `<engine_dir>/<fingerprint>/`),
+where the fingerprint is the first 16 hex digits of the checkpoint's MD5, so
+retrained weights saved under the same name get their own engines. When
+that folder is not writable, the engine goes to the cuvis-ai model cache:
+`<model cache>/trt_engines/rfdetr/<fingerprint>/`, where the model
+cache is `$CUVIS_MODEL_CACHE_DIR` (set by the CuvisNEXT runtime) or
+`~/.cuvis_runs/model_cache`. The lookup tries the fingerprint folder, then
+the 0.5.1 location directly in `<checkpoint_path>.trt/` (or `engine_dir`),
+then the model cache (the fingerprint folder and the flat one). Each engine has a `.json` build record next to it.
+The node refuses an engine whose record names a different checkpoint; run
+the `build` command with `--force` (it builds into the fingerprint folder)
+or delete the old engine. Without a CUDA device the loader skips the engine,
+so a CPU-only machine can still load the pipeline, and its first frame
+reports the missing device.
 
 TensorRT and `onnx` (needed for building) come with the optional
 `tensorrt` extra, not with the base install:
@@ -157,11 +176,12 @@ TensorRT instead of the extra. On other combinations, install the matching
 builds fp16 engines. The PyPI `-libs` packages download the real wheel
 (~2 GB) from https://pypi.nvidia.com at install time.
 
-cuvis.next's composed environments install only the base dependencies of
-node plugins, not their extras (cuvis-ai-core#89). Until that changes,
-install TensorRT into the composed environment by hand. That install is
-lost when the environment is composed anew, e.g. after a cuvis.next update
-or a change to this plugin's `pyproject.toml`.
+Since cuvis-ai-core 0.18.1 a plugin manifest can request extras: a
+manifest such as `rfdetr_seg_trt.yaml` with `extras: [tensorrt]`, listed by
+the `backend: tensorrt` pipelines only, makes the composed environment of
+those pipelines install TensorRT, and only theirs. With an older core,
+install TensorRT into the composed environment by hand; that install is
+lost when the environment is composed anew.
 
 Example: RF-DETR-Seg-L at 504 px on a Jetson AGX Thor. The network takes
 29 ms in PyTorch fp32, 20 ms as a TensorRT fp32 engine and 6 ms as a TensorRT
@@ -271,7 +291,7 @@ nodes. Released consumers should pin the git source instead (the nodes after
 ```yaml
 name: rfdetr
 repo: "https://github.com/cubert-hyperspectral/cuvis-ai-rfdetr.git"
-tag: "v0.5.1"
+tag: "v0.5.2"
 package_name: cuvis-ai-rfdetr
 capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_detector.RFDETRDetector

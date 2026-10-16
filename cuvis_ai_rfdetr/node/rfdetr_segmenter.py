@@ -12,6 +12,7 @@ from cuvis_ai_core.node.node import Node
 from cuvis_ai_schemas.enums import NodeCategory, NodeTag
 from cuvis_ai_schemas.execution import Context
 from cuvis_ai_schemas.pipeline import PortSpec
+from loguru import logger
 from torch import Tensor
 
 from cuvis_ai_rfdetr._compat import base_kwargs
@@ -219,13 +220,18 @@ class RFDETRSegmenter(Node):
           the engine: ``"fp32"`` (TensorRT's default float build, TF32 math
           allowed like the PyTorch default after ``import rfdetr``) or
           ``"fp16"``; ``jit_trace`` does not apply. Engines are specific to one
-          GPU and TensorRT version and are built once per machine, before the
-          first run: ``python -m cuvis_ai_rfdetr.trt_engine build-pipeline
-          <pipeline.yaml>``. Needs a CUDA device and the ``tensorrt`` package.
+          GPU and TensorRT version. A missing engine is built when the pipeline
+          loads (:meth:`prepare_inference`; a few minutes, once per checkpoint,
+          precision and GPU), or beforehand with ``python -m
+          cuvis_ai_rfdetr.trt_engine build-pipeline <pipeline.yaml>``. Needs a
+          CUDA device and the ``tensorrt`` package (the plugin's ``tensorrt``
+          extra).
         - ``engine_dir``: where the engines are kept (default:
-          ``<checkpoint_path>.trt/``). Engine file names carry the precision,
-          resolution, GPU and TensorRT version, so the engines of several
-          machines can share one directory.
+          ``<checkpoint_path>.trt/``), each checkpoint's in a subfolder named
+          after its fingerprint; when that is not writable, the cuvis-ai model
+          cache (see :mod:`cuvis_ai_rfdetr.trt_engine`). Engine file names carry
+          the precision, resolution, GPU and TensorRT version, so the engines of
+          several machines can share one directory.
         """
         variant_key = str(variant).lower()
         if variant_key not in _SEG_VARIANT_CLASS_NAMES:
@@ -360,6 +366,27 @@ class RFDETRSegmenter(Node):
         self._predict_kwargs: dict[str, Any] = {}
         self._predict_kwargs_for: Any = None
 
+    def prepare_inference(self) -> None:
+        """Load the TensorRT engine once the pipeline is on its device, building it first if it is missing.
+
+        cuvis-ai-core (0.18.2 and later) calls this after the pipeline has moved to its device and again after
+        every weights load. The engine depends only on ``checkpoint_path``, so later calls find it loaded and do
+        nothing. A missing engine is built on this machine under a file lock (see
+        :mod:`cuvis_ai_rfdetr.trt_engine`); a failed build raises one error that names the command to build it by
+        hand. The torch backend has nothing to prepare: its network is still built on the first frame. Without a
+        CUDA device nothing is prepared either, so a ``backend='tensorrt'`` pipeline still loads on a CPU-only
+        machine (for inspection); its first frame then reports the missing device.
+        """
+        if self.backend != "tensorrt":
+            return
+        if not torch.cuda.is_available():
+            logger.warning(
+                f"RFDETRSegmenter {self.name!r}: backend='tensorrt' and no CUDA device; the "
+                "TensorRT engine is not prepared and the first frame will fail."
+            )
+            return
+        self._ensure_model()
+
     def _ensure_model(self) -> Any:
         if self._model is None:
             model = self._build_model()
@@ -371,32 +398,20 @@ class RFDETRSegmenter(Node):
         return self._model
 
     def _load_engine(self, model: Any) -> Any:
-        """This machine's TensorRT engine for the network of ``model``, built beforehand."""
+        """This machine's TensorRT engine for the network of ``model``; a missing one is built first."""
         from cuvis_ai_rfdetr import trt_engine
 
         device = torch.device(model.model.device)
         if device.type != "cuda":
             raise RuntimeError("RFDETRSegmenter: backend='tensorrt' needs a CUDA device.")
         resolution = int(model.model.resolution)
-        engine_dir = self.engine_dir or trt_engine.default_engine_dir(self.checkpoint_path)
-        path = os.path.join(
-            engine_dir, trt_engine.engine_file_name(self.precision, resolution, device)
+        name = trt_engine.engine_file_name(self.precision, resolution, device)
+        path = trt_engine.find_engine(name, self.checkpoint_path, self.engine_dir)
+        if path is None:
+            path = self._build_engine(model, name, resolution)
+        engine = trt_engine.TensorRTEngine(
+            path, device, rebuild_hint=f"Rebuild it with: {self._build_command(resolution)} --force"
         )
-        if not os.path.exists(path):
-            build = (
-                f"python -m cuvis_ai_rfdetr.trt_engine build --checkpoint {self.checkpoint_path} "
-                f"--variant {self.variant} --resolution {resolution} --precision {self.precision}"
-            )
-            if self.checkpoint_loader != "constructor":
-                build += f" --checkpoint-loader {self.checkpoint_loader}"
-            if self.engine_dir:
-                build += f" --engine-dir {self.engine_dir}"
-            raise FileNotFoundError(
-                f"RFDETRSegmenter: no TensorRT engine for this machine at {path}. "
-                f"Build it once with: {build}"
-            )
-        trt_engine.check_engine_matches(path, self.checkpoint_path)
-        engine = trt_engine.TensorRTEngine(path, device)
         expected = (1, 3, resolution, resolution)
         if tuple(engine.input_shape) != expected:
             raise RuntimeError(
@@ -404,6 +419,42 @@ class RFDETRSegmenter(Node):
                 f"{tuple(engine.input_shape)}, the model needs {expected}; rebuild it."
             )
         return engine
+
+    def _build_command(self, resolution: int) -> str:
+        """The command that builds this node's engine by hand."""
+        from cuvis_ai_rfdetr import trt_engine
+
+        return trt_engine.build_command(
+            self.checkpoint_path,
+            self.variant,
+            resolution,
+            self.precision,
+            checkpoint_loader=self.checkpoint_loader,
+            engine_dir=self.engine_dir,
+        )
+
+    def _build_engine(self, model: Any, name: str, resolution: int) -> str:
+        """Build the missing engine ``name`` from ``model``; one error naming the manual command if that fails."""
+        from cuvis_ai_rfdetr import trt_engine
+
+        command = self._build_command(resolution)
+        if self.checkpoint_path is None or not os.path.isfile(self.checkpoint_path):
+            where = self.engine_dir or trt_engine.default_engine_dir(self.checkpoint_path)
+            raise FileNotFoundError(
+                f"RFDETRSegmenter: no TensorRT engine {name} in {where}, and no checkpoint file "
+                f"to build one from ({self.checkpoint_path}). Build it once with: {command}"
+            )
+        # cuvis-ai-core's build raises one error that names the command (failed build, no
+        # writable folder, a lock held too long)
+        return trt_engine.build_missing_engine(
+            model,
+            self.precision,
+            name,
+            checkpoint_path=self.checkpoint_path,
+            engine_dir=self.engine_dir,
+            variant=self.variant,
+            command=command,
+        )
 
     def _apply_inference_options(self, model: Any) -> Any:
         """Export / cast / trace the network per ``precision`` and ``jit_trace``.

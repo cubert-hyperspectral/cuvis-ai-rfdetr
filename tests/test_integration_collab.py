@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from cuvis_ai_rfdetr._compat import base_kwargs
 from tests.test_training_extras import _StubEma
 
 try:
@@ -46,8 +47,7 @@ def _build_tiny_pipeline():
         }
 
         def __init__(self, **kwargs):
-            name, stages = Node.consume_base_kwargs(kwargs)
-            super().__init__(name=name, execution_stages=stages, **kwargs)
+            super().__init__(**base_kwargs(kwargs), **kwargs)
             self.model = torch.nn.Linear(4, 2)
             # RFDETRTrainable-shaped attributes the callbacks rely on:
             self._input_resolution = 100
@@ -81,8 +81,7 @@ def _build_tiny_pipeline():
         OUTPUT_SPECS = {"loss": PortSpec(dtype=torch.float32, shape=())}
 
         def __init__(self, **kwargs):
-            name, stages = Node.consume_base_kwargs(kwargs)
-            super().__init__(name=name, execution_stages=stages, **kwargs)
+            super().__init__(**base_kwargs(kwargs), **kwargs)
 
         def forward(self, pred, target, context=None, **_):
             return {"loss": torch.nn.functional.mse_loss(pred, target)}
