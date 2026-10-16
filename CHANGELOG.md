@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [0.5.2] - 2026-10-15
+## [0.5.2] - 2026-10-16
 
 ### Added
 - `RFDETRSegmenter.prepare_inference()` (the cuvis-ai-core hook of 0.18.2): with `backend="tensorrt"` it loads the
