@@ -75,6 +75,31 @@ class RFDETRSegmenter(Node):
     default (``fast_paste``, bit-identical to the per-instance paste);
     ``precision``, ``jit_trace``, ``gpu_input`` and the TensorRT ``backend`` are
     opt-in (see ``__init__``).
+
+    .. note::
+       **A pipeline ``.pt`` is not self-contained for this node.** The network
+       is built when the pipeline loads (``backend="tensorrt"``) or on the
+       first frame (``backend="torch"``), and its weights are read from
+       ``checkpoint_path``. The rfdetr wrapper is not a registered submodule,
+       so ``save_to_file`` writes no RF-DETR weights into the pipeline ``.pt``.
+       Both ``checkpoint_loader`` values read that file: ``"constructor"``
+       builds the configured ``variant`` and loads the checkpoint's weights
+       into it, ``"from_checkpoint"`` takes the architecture from the
+       checkpoint (``rfdetr.RFDETR.from_checkpoint``). So ``checkpoint_path``
+       has to resolve wherever the pipeline loads; keep the checkpoint with
+       the pipeline.
+
+       With ``backend="tensorrt"`` the engine depends on the checkpoint too: it
+       is looked up next to it (``<checkpoint>.trt/``) or in ``engine_dir``,
+       then in the cuvis-ai model cache, and a missing engine is built from the
+       checkpoint at load, which needs a writable folder in one of those places.
+
+       Weights that travel inside the pipeline ``.pt`` come from training with
+       :class:`~cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable`, which
+       registers the network as a submodule, so its weights round-trip through
+       ``save_to_file`` and pipeline loading. Embedding the inference nodes'
+       weights together with their architecture arguments, so their ``.pt`` is
+       standalone, is a known future enhancement.
     """
 
     _category = NodeCategory.MODEL
