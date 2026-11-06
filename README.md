@@ -9,10 +9,8 @@ Nodes:
 
 - inference wrappers `RFDETRDetector`, `RFDETRSegmenter`;
 - an in-graph training pair `RFDETRTrainable` + `RFDETRCriterionLoss`;
-- false-colour input builders `PercentileComposite`, `ScalarMinMaxBandSlice`,
-  `FixedPCAProjection`;
-- score-map ensembles and gating `ScoreFusion`, `ScoreIntersection`,
-  `SamShellGate`;
+- false-colour input builders `PercentileComposite`, `ScalarMinMaxBandSlice`;
+- the spectral shell gate `SamShellGate`;
 - `CarlSegmenter` (CARL 61-band hyperspectral segmenter, optional).
 
 Plus training transforms for `cuvis-ai-augment`'s `AugmentationCompose`
@@ -224,31 +222,30 @@ the checkpoint into the inference nodes remains the reference path.
 into DETR label `c - 1` (e.g. COCO categories 1/2/3 → model classes 0/1/2);
 the default keeps the single-class behaviour (all foreground = label 0).
 
-## More input builders: `ScalarMinMaxBandSlice`, `FixedPCAProjection`
+## More input builders: `ScalarMinMaxBandSlice`
 
 - `ScalarMinMaxBandSlice(bands_nm=(640, 550, 470))` — `cube` + `wavelengths` →
   `rgb_image [B, H, W, 3]` in [0, 1]: ONE min / max over the whole cube (band
   ratios preserved), then the three bands nearest `bands_nm`. Use it when a
   checkpoint was trained on that recipe; it is not the same image as a
   per-channel stretch (`FixedWavelengthSelector(norm_mode="per_frame")`).
-- `FixedPCAProjection(projection_path=...)` — cuvis-ai's `TrainablePCA` with a
-  frozen projection loaded from an `.npz` (`mean` [C], `comps` [K, C], `lo` /
-  `hi` [K]); never refits at inference. `input_global_minmax` (default on)
-  min-maxes each cube globally first, so raw-scale reflectance (as cuvis.next
-  delivers it) and [0, 1] cubes give the same projection. Needs `cuvis-ai`
-  installed (parent class).
 
-## Ensembles and gating: `ScoreFusion`, `ScoreIntersection`, `SamShellGate`
+## Ensembles and gating: cuvis-ai built-ins and `SamShellGate`
 
-All take and return `scores [B, H, W, 1]` float32; stateless and torch-native.
+`ScoreFusion`, `ScoreIntersection` and `FixedPCAProjection` were removed in 0.6.0; they are cuvis-ai
+built-ins since cuvis-ai 0.19.1:
 
-- `ScoreFusion(mode, weight)` — fuse two score maps (`a`, `b`): `min` (AND),
-  `max` (OR), `mean`, `gmean` (geometric), `wmean` (`weight`·a +
-  (1 − `weight`)·b). For ensembles feed un-thresholded maps (segmenter
-  `threshold` ≈ 0.05) and threshold the fused map once downstream.
-- `ScoreIntersection` — elementwise minimum; the same as
-  `ScoreFusion(mode="min")`, kept for existing pipelines.
-- `SamShellGate(reference, threshold_deg)` — zero the scores where the
+| up to 0.5.x | cuvis-ai built-in |
+| --- | --- |
+| `ScoreFusion(mode)` (`a`, `b`) | `cuvis_ai.node.fusion.ScoreMapFusion(mode)`, any number of maps on its `scores` input |
+| `ScoreIntersection` | `ScoreMapFusion(mode="min")` |
+| `FixedPCAProjection(projection_path=...)` | `cuvis_ai.node.dimensionality_reduction.FixedPCAProjection` |
+
+cuvis-ai's `migrate-plugin-nodes` rewrites a pipeline and its `.pt` (the `min`, `max` and `mean`
+modes bit for bit). For ensembles feed un-thresholded maps (segmenter `threshold` ≈ 0.05) and
+threshold the fused map once downstream.
+
+- `SamShellGate(reference, threshold_deg)` — `scores [B, H, W, 1]` in and out; zero the scores where the
   raw-cosine spectral angle of the pixel's full spectrum (`cube`) to a fixed
   reference spectrum exceeds `threshold_deg`; drops look-alike objects with a
   different spectrum. Illumination-scale invariant.
@@ -300,9 +297,6 @@ capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_loss.RFDETRCriterionLoss
   - class_name: cuvis_ai_rfdetr.node.percentile_composite.PercentileComposite
   - class_name: cuvis_ai_rfdetr.node.scalar_minmax_bandslice.ScalarMinMaxBandSlice
-  - class_name: cuvis_ai_rfdetr.node.fixed_pca_projection.FixedPCAProjection
-  - class_name: cuvis_ai_rfdetr.node.score_fusion.ScoreFusion
-  - class_name: cuvis_ai_rfdetr.node.score_intersection.ScoreIntersection
   - class_name: cuvis_ai_rfdetr.node.sam_shell_gate.SamShellGate
   - class_name: cuvis_ai_rfdetr.node.carl_segmenter.CarlSegmenter
 ```
@@ -339,13 +333,14 @@ walnut deploy pipelines could ship together. Tracked moves:
 | what | destination | issue |
 | --- | --- | --- |
 | `RandomZoom`, `RandomShading`, `RandomGammaContrast`, `RandomGaussianBlur` | `cuvis-ai-augment` | #13 |
-| `ScoreFusion`, `SamShellGate` (→ generic `SpectralAngleGate`); retire `ScoreIntersection` | `cuvis-ai` builtins | #14 |
-| `ScalarMinMaxBandSlice`, `FixedPCAProjection` (optional: `PercentileComposite`) | `cuvis-ai` builtins | #15 |
+| `SamShellGate` (→ generic `SpectralAngleGate`) | `cuvis-ai` builtins | #14 |
+| `ScalarMinMaxBandSlice` (optional: `PercentileComposite`) | `cuvis-ai` builtins | #15 |
 | `CarlSegmenter` | new `cuvis-ai-carl` plugin | #16 |
 | `_compat.base_kwargs` (core < 0.15 shim) | delete once the core floor is ≥ 0.15 | #17 |
 
 Moves happen in the destination first; pipelines and consumer manifests switch
-over; the code is removed here last.
+over; the code is removed here last. Done: `ScoreFusion`, `ScoreIntersection` and
+`FixedPCAProjection` (cuvis-ai 0.19.1; removed here in 0.6.0).
 
 ## Tests
 
