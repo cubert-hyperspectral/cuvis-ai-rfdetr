@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Removed
+- Removed `ScoreFusion`, `ScoreIntersection` and `FixedPCAProjection`, which are cuvis-ai built-ins
+  since cuvis-ai 0.19.1: `cuvis_ai.node.fusion.ScoreMapFusion` fuses any number of maps
+  (`ScoreIntersection` is its `min` mode) and `cuvis_ai.node.dimensionality_reduction.FixedPCAProjection`
+  loads the frozen projection. cuvis-ai's `migrate-plugin-nodes` rewrites a pipeline and its `.pt`
+  (`min`, `max` and `mean` bit for bit); a pipeline that still names the old classes needs a 0.5.x
+  release. There was no deprecation release.
+
 ### Changed
 - Documented that the inference nodes `RFDETRSegmenter` and `RFDETRDetector` keep their network
   outside the pipeline state: the weights are read from `checkpoint_path` with either
