@@ -132,7 +132,10 @@ class EmaCallback(pl.Callback):
         (``tau=0`` means a constant ``decay``). Defaults match RF-DETR's trainer
         defaults for fine-tuning (decay ``0.993``, tau ``100``).
     update_interval : int
-        Update the average every N optimizer batches (native ``ema_update_interval``).
+        Update the average every N optimizer steps (native ``ema_update_interval``).
+        As in RF-DETR's trainer the average moves once per optimizer step (a batch
+        that only accumulates gradients leaves the weights unchanged) and once more
+        at the end of every training epoch.
     save_path : str or None
         When set, the EMA weights are written there at ``fit`` end (same payload
         as :meth:`save`).
@@ -167,6 +170,7 @@ class EmaCallback(pl.Callback):
         self.ema = None  # EMA instance, built on fit start
         self._node = None
         self._batches_seen = 0
+        self._last_step = 0  # trainer.global_step at the last per-step update
         self._pending_state: dict[str, Any] | None = None  # restored ckpt state
 
     # ------------------------------------------------------------- resolution
@@ -206,6 +210,7 @@ class EmaCallback(pl.Callback):
             self.ema.module.load_state_dict(self._pending_state["ema_state"])
             self.ema.updates = int(self._pending_state["updates"])
             self._batches_seen = int(self._pending_state["batches_seen"])
+            self._last_step = int(self._pending_state.get("last_step", 0))
             self._pending_state = None
 
     def on_train_batch_end(
@@ -217,7 +222,21 @@ class EmaCallback(pl.Callback):
         batch_idx: int,
     ) -> None:
         self._batches_seen += 1
-        if self._batches_seen % self.update_interval == 0:
+        step = getattr(trainer, "global_step", None)
+        if step is None:  # no optimizer-step counter (bare test doubles): count batches
+            if self._batches_seen % self.update_interval == 0:
+                self.ema.update(self._node.model)
+            return
+        # RF-DETR's EMA callback: update only after an optimizer step happened.
+        if int(step) <= self._last_step:
+            return
+        self._last_step = int(step)
+        if self._last_step % self.update_interval == 0:
+            self.ema.update(self._node.model)
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        # RF-DETR averages once more at the end of every training epoch.
+        if self.ema is not None and getattr(trainer, "global_step", None) is not None:
             self.ema.update(self._node.model)
 
     def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
@@ -239,6 +258,7 @@ class EmaCallback(pl.Callback):
             "ema_state": self.ema.module.state_dict(),
             "updates": int(self.ema.updates),
             "batches_seen": int(self._batches_seen),
+            "last_step": int(self._last_step),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
