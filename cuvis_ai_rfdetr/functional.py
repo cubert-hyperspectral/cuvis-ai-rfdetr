@@ -184,6 +184,7 @@ def targets_from_mask(
     min_pixels: int = 1,
     multiclass: bool = False,
     label_offset: int = 1,
+    single_label: int = 0,
 ) -> list[dict[str, Tensor]]:
     """Build DETR-style targets from an integer instance/class mask.
 
@@ -198,13 +199,17 @@ def targets_from_mask(
         Components smaller than this are ignored.
     multiclass : bool
         ``False`` (default): connected components of ``mask > 0`` become one target
-        instance each, all with label ``0`` — the single-class (foreign-object) case.
+        instance each, all with label ``single_label`` — the single-class (foreign-object) case.
         ``True``: for each distinct class value ``c > 0`` in the mask, connected
         components of ``mask == c`` become instances with label ``c - label_offset``.
     label_offset : int
         Subtracted from each class value to map mask class ids to 0-indexed model
         labels (default ``1``: COCO category ids 1/2/3 -> model classes 0/1/2, matching
         RF-DETR's roboflow loader). Only used when ``multiclass`` is True.
+    single_label : int
+        Model label of every instance in the single-class case (default ``0``). A
+        Roboflow-style class list ``["fo-background", "fo"]`` keeps the object class at
+        ``1``. Only used when ``multiclass`` is False.
 
     Returns
     -------
@@ -222,35 +227,23 @@ def targets_from_mask(
     _, height, width = m_np.shape
     out: list[dict[str, Tensor]] = []
     for b in range(m_np.shape[0]):
-        m = m_np[b]
-        # (binary_selector, class_label) pairs whose connected components become instances
-        if multiclass:
-            groups = [(m == c, int(c) - label_offset) for c in np.unique(m) if c > 0]
-        else:
-            groups = [(m > 0, 0)]
         boxes: list[list[float]] = []
         labels: list[int] = []
         masks: list[np.ndarray] = []
-        for selector, class_label in groups:
-            lbl, n = ndimage.label(selector)
-            for i in range(1, n + 1):
-                comp = lbl == i
-                if int(comp.sum()) < min_pixels:
-                    continue
-                ys, xs = np.nonzero(comp)
-                x0, x1 = float(xs.min()), float(xs.max()) + 1.0
-                y0, y1 = float(ys.min()), float(ys.max()) + 1.0
-                boxes.append(
-                    [
-                        (x0 + x1) / 2.0 / width,
-                        (y0 + y1) / 2.0 / height,
-                        (x1 - x0) / width,
-                        (y1 - y0) / height,
-                    ]
-                )
-                labels.append(class_label)
-                if with_masks:
-                    masks.append(comp)
+        for comp, class_label, (x0, y0, x1, y1) in _mask_instances(
+            m_np[b], ndimage, multiclass, label_offset, single_label, min_pixels
+        ):
+            boxes.append(
+                [
+                    (x0 + x1) / 2.0 / width,
+                    (y0 + y1) / 2.0 / height,
+                    (x1 - x0) / width,
+                    (y1 - y0) / height,
+                ]
+            )
+            labels.append(class_label)
+            if with_masks:
+                masks.append(comp)
         target: dict[str, Tensor] = {
             "boxes": torch.tensor(boxes, dtype=torch.float32, device=device).reshape(-1, 4),
             "labels": torch.tensor(labels, dtype=torch.int64, device=device),
@@ -263,3 +256,95 @@ def targets_from_mask(
             )
         out.append(target)
     return out
+
+
+def _mask_instances(
+    m: np.ndarray,
+    ndimage,
+    multiclass: bool,
+    label_offset: int,
+    single_label: int,
+    min_pixels: int,
+) -> list[tuple[np.ndarray, int, tuple[float, float, float, float]]]:
+    """Connected-component instances of one ``[H, W]`` mask.
+
+    Returns ``(component_mask, label, (x0, y0, x1, y1))`` per instance, the box in
+    absolute pixels with exclusive right/bottom edges (COCO ``x + w`` convention).
+    """
+    # (binary_selector, class_label) pairs whose connected components become instances
+    if multiclass:
+        groups = [(m == c, int(c) - label_offset) for c in np.unique(m) if c > 0]
+    else:
+        groups = [(m > 0, int(single_label))]
+    instances = []
+    for selector, class_label in groups:
+        lbl, n = ndimage.label(selector)
+        for i in range(1, n + 1):
+            comp = lbl == i
+            if int(comp.sum()) < min_pixels:
+                continue
+            ys, xs = np.nonzero(comp)
+            box = (float(xs.min()), float(ys.min()), float(xs.max()) + 1.0, float(ys.max()) + 1.0)
+            instances.append((comp, class_label, box))
+    return instances
+
+
+def native_targets_from_mask(
+    mask: np.ndarray,
+    image_id: int = 0,
+    with_masks: bool = False,
+    min_pixels: int = 1,
+    multiclass: bool = False,
+    label_offset: int = 1,
+    single_label: int = 0,
+) -> dict[str, Tensor]:
+    """One ``[H, W]`` integer mask -> a target in RF-DETR's dataset format (before transforms).
+
+    The dict RF-DETR's ``CocoDetection`` hands to its transforms: ``boxes`` ``[N, 4]``
+    absolute xyxy, ``labels`` ``[N]`` int64, ``image_id`` ``[1]``, ``area`` ``[N]``
+    (instance pixel count), ``iscrowd`` ``[N]`` zeros, ``orig_size`` and ``size`` as
+    ``[H, W]``, plus ``masks`` ``[N, H, W]`` bool when ``with_masks``. RF-DETR's own
+    transforms then resize/crop/flip image and target together and turn the boxes into
+    normalized cxcywh. Instances are the connected components of the mask, labelled as
+    in :func:`targets_from_mask`. CPU tensors.
+    """
+    from scipy import ndimage  # heavy import kept out of module import time
+
+    if mask.ndim != 2:
+        raise ValueError(f"native_targets_from_mask expects [H, W], got {mask.shape}.")
+    height, width = mask.shape
+    instances = _mask_instances(mask, ndimage, multiclass, label_offset, single_label, min_pixels)
+    target: dict[str, Tensor] = {
+        "boxes": torch.tensor([box for _, _, box in instances], dtype=torch.float32).reshape(-1, 4),
+        "labels": torch.tensor([label for _, label, _ in instances], dtype=torch.int64),
+        "image_id": torch.tensor([int(image_id)], dtype=torch.int64),
+        "area": torch.tensor([float(comp.sum()) for comp, _, _ in instances], dtype=torch.float32),
+        "iscrowd": torch.zeros(len(instances), dtype=torch.int64),
+        "orig_size": torch.tensor([int(height), int(width)], dtype=torch.int64),
+        "size": torch.tensor([int(height), int(width)], dtype=torch.int64),
+    }
+    if with_masks:
+        target["masks"] = (
+            torch.as_tensor(np.stack([comp for comp, _, _ in instances])).to(dtype=torch.bool)
+            if instances
+            else torch.zeros((0, height, width), dtype=torch.bool)
+        )
+    return target
+
+
+def tile_rows(x: Tensor, tile_rows: int, row_starts) -> Tensor:
+    """Cut ``[B, H, ...]`` into row tiles: ``[B * len(row_starts), tile_rows, ...]``.
+
+    Tile ``t`` of frame ``b`` is ``x[b, row_starts[t] : row_starts[t] + tile_rows]``; the
+    output keeps frame-major order (all tiles of frame 0, then frame 1, ...). Used for
+    fixed-row evaluation tiles such as rows 0 / 291 / 582 of a 987-row frame.
+    """
+    starts = [int(s) for s in row_starts]
+    height = int(x.shape[1])
+    for s in starts:
+        if s < 0 or s + int(tile_rows) > height:
+            raise ValueError(
+                f"tile_rows: tile [{s}, {s + int(tile_rows)}) does not fit a frame of {height} rows."
+            )
+    tiles = [x[:, s : s + int(tile_rows)] for s in starts]  # T x [B, tile_rows, ...]
+    return torch.stack(tiles, dim=1).reshape(-1, int(tile_rows), *x.shape[2:])

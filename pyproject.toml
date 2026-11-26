@@ -61,6 +61,9 @@ dependencies = [
 
 [project.optional-dependencies]
 train = ["rfdetr[train]>=1.8,<2"]
+# Albumentations, for RFDETRTrainable(aug_config="rfdetr_1_8"): the training augmentation RF-DETR
+# used by default before 1.9 (1.9 moved its default to torchvision).
+augment = ["rfdetr[augment]>=1.8,<2"]
 # TensorRT backend of RFDETRSegmenter (backend="tensorrt"). The wheel follows torch's CUDA: cu13 on
 # Linux aarch64 (Jetson Thor), cu12 on Windows / Linux x86_64. TensorRT 10: TensorRT 11 dropped the FP16
 # builder flag. Engines are tied to the TensorRT version, so a different version means rebuilding them.

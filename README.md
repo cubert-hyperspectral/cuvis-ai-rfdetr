@@ -216,13 +216,52 @@ pipeline save/load, and Roboflow `.pth` checkpoints load via
 `functional.targets_from_mask` builds DETR targets from integer masks.
 Requires the `[train]` extra.
 
-For runs that must match RF-DETR's own trainer exactly (EMA, LR schedule,
-multi-scale augmentation), fine-tuning with the upstream trainer and loading
-the checkpoint into the inference nodes remains the reference path.
-
 `RFDETRTrainable(multiclass_targets=True)` turns each mask class id `c > 0`
 into DETR label `c - 1` (e.g. COCO categories 1/2/3 → model classes 0/1/2);
 the default keeps the single-class behaviour (all foreground = label 0).
+
+### Training like RF-DETR's own trainer (trainrun YAML, CuvisNEXT)
+
+These options make a pipeline training run feed and update the model the way
+RF-DETR's trainer does. All are off by default.
+
+| piece | how |
+| --- | --- |
+| class head sized from a class list | `class_names` on `RFDETRTrainable`, `RFDETRCriterionLoss` and `RFDETRMapMetric`; `target_class_id` is the label of every object in the single-class case (`1` for `["fo-background", "fo"]`) |
+| JPEG inputs | `jpeg_roundtrip` / `jpeg_quality` on `RFDETRTrainable` (for recipes trained on JPEG files) |
+| RF-DETR's transforms and batch padding | `native_transforms: true`; the train / val transforms come from RF-DETR's own builder with the variant's train config (square resize, multi-scale, `do_random_resize_via_padding`); `aug_config` picks the augmentation: `null` = the installed RF-DETR's default, `"rfdetr_1_8"` = the Albumentations default RF-DETR used before 1.9 (needs the `augment` extra) |
+| fixed-row evaluation tiles | `eval_tile_rows` / `eval_row_starts` (training crops come from an upstream crop transform) |
+| per-layer learning rates and EMA | `optimizer: {name: rfdetr_adamw}` in the trainrun; `ema_decay` / `ema_tau` and `lr_encoder` / `lr_vit_layer_decay` / `lr_component_decay` on `RFDETRTrainable` (defaults: RF-DETR's train config) |
+| best checkpoint by mAP over live and EMA weights | `RFDETRMapMetric` as a metric node, checkpoint `monitor: MapMetric/best_mAP_50_95`, `mode: max` |
+| gradient clipping, accumulation, mixed precision | the trainrun's `gradient_clip_val` (0.1), `accumulate_grad_batches`, `precision` |
+| prediction from the saved run | `RFDETRSegmenter(checkpoint_loader="pipeline", checkpoint_path=<run>/saved/trainrun_pipeline.pt)`; takes the settings from the run's yaml and the weights the metric recorded as best |
+
+`rfdetr_adamw` is registered in cuvis-ai-core's optimizer registry when the
+training node's module is imported. It is a bridge until core lets a node
+contribute learning-rate groups and EMA itself; it then goes away.
+
+The same options in a training graph (segmentation medium, two classes):
+
+```yaml
+- name: RFDETR
+  class_name: cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable
+  hparams:
+    dataset_dir: "."
+    variant: medium
+    segmentation: true
+    resolution: 624
+    class_names: [fo-background, fo]
+    target_class_id: 1
+    jpeg_roundtrip: true
+    native_transforms: true
+    eval_tile_rows: 405
+    eval_row_starts: [0, 291, 582]
+    ema_decay: 0.993
+    ema_tau: 100
+- name: MapMetric
+  class_name: cuvis_ai_rfdetr.node.rfdetr_map_metric.RFDETRMapMetric
+  hparams: {variant: medium, segmentation: true, resolution: 624, class_names: [fo-background, fo]}
+```
 
 ## More input builders: `ScalarMinMaxBandSlice`, `FixedPCAProjection`
 
@@ -298,6 +337,7 @@ capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_segmenter.RFDETRSegmenter
   - class_name: cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable
   - class_name: cuvis_ai_rfdetr.node.rfdetr_loss.RFDETRCriterionLoss
+  - class_name: cuvis_ai_rfdetr.node.rfdetr_map_metric.RFDETRMapMetric
   - class_name: cuvis_ai_rfdetr.node.percentile_composite.PercentileComposite
   - class_name: cuvis_ai_rfdetr.node.scalar_minmax_bandslice.ScalarMinMaxBandSlice
   - class_name: cuvis_ai_rfdetr.node.fixed_pca_projection.FixedPCAProjection

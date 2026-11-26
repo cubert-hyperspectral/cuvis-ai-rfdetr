@@ -168,6 +168,8 @@ class RFDETRSegmenter(Node):
         gpu_input: bool = False,
         backend: str = "torch",
         engine_dir: str | None = None,
+        checkpoint_node: str = "RFDETR",
+        checkpoint_stream: str = "auto",
         **kwargs: Any,
     ) -> None:
         """Configure the segmenter without loading any weights yet.
@@ -192,6 +194,17 @@ class RFDETRSegmenter(Node):
           harnesses that load checkpoints the same way; ``resolution`` (if
           set) is forwarded as an explicit override, and ``variant`` must
           match the class resolved from the checkpoint.
+        - ``"pipeline"``: ``checkpoint_path`` is a pipeline weights file saved by
+          a cuvis-ai training run (e.g. CuvisNEXT's
+          ``<run>/saved/trainrun_pipeline.pt``, with its ``.yaml`` beside it).
+          The network settings (variant, segmentation, resolution, class list)
+          come from the hparams of the :class:`RFDETRTrainable` node named
+          ``checkpoint_node`` in that yaml, the weights from that node's state.
+          ``checkpoint_stream`` picks the live weights (``"regular"``), the EMA
+          weights (``"ema"``), or (``"auto"``, default) the ones an
+          :class:`RFDETRMapMetric` in the run recorded as best (``selected_stream``;
+          regular when the run has no such record). ``resolution`` (if set)
+          overrides the training resolution.
 
         Parity parameters (for byte-faithful reproduction of evaluation
         harnesses built around per-tile JPEG files and top-fraction image
@@ -301,10 +314,22 @@ class RFDETRSegmenter(Node):
         if not 0.0 < top_frac <= 1.0:
             raise ValueError(f"RFDETRSegmenter: top_frac must be within (0, 1], got {top_frac}.")
         checkpoint_loader = str(checkpoint_loader).lower()
-        if checkpoint_loader not in ("constructor", "from_checkpoint"):
+        if checkpoint_loader not in ("constructor", "from_checkpoint", "pipeline"):
             raise ValueError(
-                f"RFDETRSegmenter: checkpoint_loader must be 'constructor' or "
-                f"'from_checkpoint', got {checkpoint_loader!r}."
+                f"RFDETRSegmenter: checkpoint_loader must be 'constructor', "
+                f"'from_checkpoint' or 'pipeline', got {checkpoint_loader!r}."
+            )
+        if checkpoint_loader == "pipeline" and checkpoint_path is None:
+            raise ValueError(
+                "RFDETRSegmenter: checkpoint_loader='pipeline' needs checkpoint_path "
+                "(the training run's pipeline .pt)."
+            )
+        checkpoint_node = str(checkpoint_node)
+        checkpoint_stream = str(checkpoint_stream).lower()
+        if checkpoint_stream not in ("auto", "regular", "ema"):
+            raise ValueError(
+                f"RFDETRSegmenter: checkpoint_stream must be 'auto', 'regular' or 'ema', "
+                f"got {checkpoint_stream!r}."
             )
         fast_paste = bool(fast_paste)
         precision = str(precision).lower()
@@ -356,6 +381,8 @@ class RFDETRSegmenter(Node):
         self.gpu_input = gpu_input
         self.backend = backend
         self.engine_dir = engine_dir
+        self.checkpoint_node = checkpoint_node
+        self.checkpoint_stream = checkpoint_stream
 
         super().__init__(
             **base_kwargs(kwargs),
@@ -379,6 +406,8 @@ class RFDETRSegmenter(Node):
             gpu_input=self.gpu_input,
             backend=self.backend,
             engine_dir=self.engine_dir,
+            checkpoint_node=self.checkpoint_node,
+            checkpoint_stream=self.checkpoint_stream,
             **kwargs,
         )
 
@@ -511,6 +540,8 @@ class RFDETRSegmenter(Node):
             ) from exc
 
         class_name = _SEG_VARIANT_CLASS_NAMES[self.variant]
+        if self.checkpoint_loader == "pipeline":
+            return self._build_from_pipeline(rfdetr, class_name)
         if self.checkpoint_path is not None and self.checkpoint_loader == "from_checkpoint":
             loader = getattr(rfdetr, "RFDETR", None)
             if loader is None or not hasattr(loader, "from_checkpoint"):
@@ -543,6 +574,76 @@ class RFDETRSegmenter(Node):
         if self.resolution is not None:
             model_kwargs["resolution"] = int(self.resolution)
         return model_cls(**model_kwargs)
+
+    def _build_from_pipeline(self, rfdetr: Any, class_name: str) -> Any:
+        """The trained network of an ``RFDETRTrainable`` node in a saved training pipeline."""
+        from pathlib import Path
+
+        import yaml
+
+        weights_path = Path(str(self.checkpoint_path))
+        config_path = weights_path.with_suffix(".yaml")
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"RFDETRSegmenter: checkpoint_loader='pipeline' needs the pipeline yaml "
+                f"next to {weights_path} ({config_path} not found)."
+            )
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        node_config = next(
+            (n for n in config.get("nodes", []) if n.get("name") == self.checkpoint_node), None
+        )
+        if node_config is None:
+            raise ValueError(
+                f"RFDETRSegmenter: no node named {self.checkpoint_node!r} in {config_path}."
+            )
+        hparams = node_config.get("hparams") or {}
+        if not bool(hparams.get("segmentation", False)):
+            raise ValueError(
+                f"RFDETRSegmenter: node {self.checkpoint_node!r} in {config_path} was trained "
+                "for detection (segmentation is false)."
+            )
+        trained_variant = str(hparams.get("variant", "medium")).lower()
+        if trained_variant != self.variant:
+            raise ValueError(
+                f"RFDETRSegmenter: node {self.checkpoint_node!r} was trained as variant "
+                f"{trained_variant!r}, this node is configured as {self.variant!r}."
+            )
+        if int(hparams.get("num_channels", 3)) != 3:
+            raise ValueError("RFDETRSegmenter: the trained network does not take 3-channel images.")
+
+        payload = torch.load(weights_path, map_location="cpu", weights_only=False)
+        states = payload.get("state_dict", payload)
+        state = states.get(self.checkpoint_node)
+        if state is None:
+            raise KeyError(
+                f"RFDETRSegmenter: {weights_path} holds no weights for node {self.checkpoint_node!r}."
+            )
+        stream = self.checkpoint_stream
+        if stream == "auto":
+            stream = "regular"
+            for name, node_state in states.items():
+                if name != self.checkpoint_node and "selected_stream" in node_state:
+                    stream = "ema" if int(node_state["selected_stream"]) == 1 else "regular"
+                    break
+        prefix = "ema_model." if stream == "ema" else "model."
+        weights = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
+        if not weights:
+            raise KeyError(
+                f"RFDETRSegmenter: node {self.checkpoint_node!r} in {weights_path} has no "
+                f"{stream} weights ({prefix}*)."
+            )
+
+        model_kwargs: dict[str, Any] = {"pretrain_weights": None}
+        resolution = self.resolution if self.resolution is not None else hparams.get("resolution")
+        if resolution is not None:
+            model_kwargs["resolution"] = int(resolution)
+        class_names = hparams.get("class_names")
+        if class_names:
+            model_kwargs["num_classes"] = len(class_names)
+        model = getattr(rfdetr, class_name)(**model_kwargs)
+        model.model.model.load_state_dict(weights, strict=True)
+        self.loaded_stream = stream
+        return model
 
     def _extra_predict_kwargs(self, model: Any) -> dict[str, Any]:
         """``include_source_image=False`` when ``model.predict`` accepts it.

@@ -9,6 +9,7 @@ capabilities:
   - class_name: cuvis_ai_rfdetr.node.rfdetr_segmenter.RFDETRSegmenter
   - class_name: cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable
   - class_name: cuvis_ai_rfdetr.node.rfdetr_loss.RFDETRCriterionLoss
+  - class_name: cuvis_ai_rfdetr.node.rfdetr_map_metric.RFDETRMapMetric
   - class_name: cuvis_ai_rfdetr.node.percentile_composite.PercentileComposite
   - class_name: cuvis_ai_rfdetr.node.scalar_minmax_bandslice.ScalarMinMaxBandSlice
   - class_name: cuvis_ai_rfdetr.node.score_intersection.ScoreIntersection
