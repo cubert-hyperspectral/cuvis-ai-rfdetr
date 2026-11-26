@@ -23,7 +23,7 @@ class RFDETRCriterionLoss(Node):
     Consumes the ``outputs`` + ``targets`` ports of
     :class:`~cuvis_ai_rfdetr.node.rfdetr_trainable.RFDETRTrainable` — configure
     both nodes with the **same** ``variant`` / ``segmentation`` /
-    ``dataset_dir`` so the criterion matches the model — and emits the scalar
+    ``dataset_dir`` / ``class_names`` so the criterion matches the model — and emits the scalar
     weighted-sum loss exactly as Roboflow's own trainer computes it
     (``sum(loss_dict[k] * weight_dict[k])``).
 
@@ -61,6 +61,7 @@ class RFDETRCriterionLoss(Node):
         variant: str = "medium",
         segmentation: bool = False,
         resolution: int | None = None,
+        class_names: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
         variant_key = str(variant).lower()
@@ -70,10 +71,15 @@ class RFDETRCriterionLoss(Node):
                 f"RFDETRCriterionLoss: variant must be one of {sorted(table)} for "
                 f"segmentation={bool(segmentation)}, got {variant!r}."
             )
+        if class_names is not None:
+            class_names = [str(name) for name in class_names]
+            if not class_names:
+                raise ValueError("RFDETRCriterionLoss: class_names must not be empty.")
         self.dataset_dir = str(dataset_dir)
         self.variant = variant_key
         self.segmentation = bool(segmentation)
         self.resolution = int(resolution) if resolution is not None else None
+        self.class_names = class_names
 
         assert "execution_stages" not in kwargs, "loss nodes fix their own execution stages"
         super().__init__(
@@ -82,6 +88,7 @@ class RFDETRCriterionLoss(Node):
             variant=self.variant,
             segmentation=self.segmentation,
             resolution=self.resolution,
+            class_names=self.class_names,
             **kwargs,
         )
 
@@ -98,6 +105,8 @@ class RFDETRCriterionLoss(Node):
         wrapper_kwargs: dict[str, Any] = {}
         if self.resolution is not None:
             wrapper_kwargs["resolution"] = self.resolution
+        if self.class_names is not None:  # same class count as the training node's head
+            wrapper_kwargs["num_classes"] = len(self.class_names)
         wrapper = wrapper_cls(**wrapper_kwargs)
         model_config = wrapper.model_config
         train_config = wrapper.get_train_config(dataset_dir=self.dataset_dir, epochs=1)

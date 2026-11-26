@@ -193,7 +193,8 @@ def test_trainable_and_loss_import_without_rfdetr() -> None:
     from cuvis_ai_rfdetr.node.rfdetr_loss import RFDETRCriterionLoss
     from cuvis_ai_rfdetr.node.rfdetr_trainable import RFDETRTrainable
 
-    assert set(RFDETRTrainable.OUTPUT_SPECS) == {"outputs", "targets"}
+    assert set(RFDETRTrainable.OUTPUT_SPECS) == {"outputs", "targets", "ema_outputs"}
+    assert RFDETRTrainable.OUTPUT_SPECS["ema_outputs"].optional
     assert set(RFDETRCriterionLoss.OUTPUT_SPECS) == {"loss"}
     assert RFDETRTrainable.INPUT_SPECS["targets_mask"].optional
 
@@ -225,6 +226,7 @@ def test_manifest_lists_all_nodes() -> None:
         "RFDETRSegmenter",
         "RFDETRTrainable",
         "RFDETRCriterionLoss",
+        "RFDETRMapMetric",
         "PercentileComposite",
         "ScalarMinMaxBandSlice",
         "ScoreIntersection",

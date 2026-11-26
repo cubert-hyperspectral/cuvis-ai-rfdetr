@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+### Added
+- Pipeline training that matches RF-DETR's own trainer, usable from a trainrun YAML (CuvisNEXT).
+  All new options are off by default; existing trainings are unchanged.
+  - `RFDETRTrainable`: `class_names` sizes the class head from a class list (as RF-DETR aligns it to
+    the dataset's categories), `target_class_id` sets the label of every object in the single-class
+    case; `jpeg_roundtrip` / `jpeg_quality`; `native_transforms` runs RF-DETR's own train / val
+    transforms per image and pads the batch like RF-DETR's data loader, with `aug_config` (`null`:
+    the installed RF-DETR's default; `"rfdetr_1_8"`: the Albumentations default of RF-DETR before
+    1.9); `eval_tile_rows` / `eval_row_starts` cut val / test frames into fixed row tiles;
+    `ema_decay` / `ema_tau` keep RF-DETR's weight average (`ema_model`, one update per optimizer
+    step and one per epoch end) and emit `ema_outputs` at val / test; `lr_encoder` /
+    `lr_vit_layer_decay` / `lr_component_decay` set the per-layer learning rates.
+  - `rfdetr_adamw` optimizer, registered in cuvis-ai-core's optimizer registry on import: AdamW over
+    RF-DETR's native parameter groups, with the training node's EMA update after each step. A bridge
+    until core accepts learning-rate groups and EMA from the training config.
+  - `RFDETRMapMetric` metric node: val / test COCO mAP pooled over the pass as RF-DETR's
+    `COCOEvalCallback` computes it (bbox and segm, live and EMA weights) and `best_mAP_50_95` for
+    the best-of-both checkpoint choice; its `selected_stream` buffer records which weights won.
+  - `RFDETRSegmenter(checkpoint_loader="pipeline")` loads the network of a saved training run
+    (`.pt` + `.yaml`): settings from the training node's hparams, weights from its state
+    (`checkpoint_node`, `checkpoint_stream`: `auto` / `regular` / `ema`).
+  - `class_names` on `RFDETRCriterionLoss`, so its criterion matches the training node's head.
+  - `functional.native_targets_from_mask` (targets in RF-DETR's dataset format) and
+    `functional.tile_rows`; `targets_from_mask(single_label=...)`.
+  - `augment` extra (`rfdetr[augment]`) for the `"rfdetr_1_8"` augmentation.
+
+### Fixed
+- `EmaCallback` updates the average once per optimizer step (and once per epoch end), as RF-DETR's
+  trainer does. Before it updated after every batch, so with gradient accumulation the average moved
+  several times per optimizer step.
+- `RFDETRTrainable` imports `NestedTensor` from `rfdetr.utilities.tensors`. The old
+  `rfdetr.util.misc` module was removed in RF-DETR 1.9.0, so training failed at the first step with
+  any RF-DETR the dependency range allows from 1.9 on (the lock has 1.9.1). The new module is in
+  1.8.3, 1.9.4 and 1.10.0.
+
 ### Changed
 - Documented that the inference nodes `RFDETRSegmenter` and `RFDETRDetector` keep their network
   outside the pipeline state: the weights are read from `checkpoint_path` with either
