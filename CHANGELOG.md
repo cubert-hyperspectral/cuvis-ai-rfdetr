@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+- `RFDETRTrainable` imports `NestedTensor` from `rfdetr.utilities.tensors`. The old
+  `rfdetr.util.misc` module was removed in RF-DETR 1.9.0, so training failed at the first step with
+  any RF-DETR the dependency range allows from 1.9 on (the lock has 1.9.1). The new module is in
+  1.8.3, 1.9.4 and 1.10.0.
+
 ### Changed
 - Documented that the inference nodes `RFDETRSegmenter` and `RFDETRDetector` keep their network
   outside the pipeline state: the weights are read from `checkpoint_path` with either

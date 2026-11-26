@@ -389,7 +389,7 @@ class RFDETRTrainable(Node):
                 f"RFDETRTrainable expects rgb_image of shape [B, H, W, {self.num_channels}], "
                 f"got {tuple(rgb_image.shape)}."
             )
-        from rfdetr.util.misc import NestedTensor  # lazy: heavy package
+        from rfdetr.utilities.tensors import NestedTensor  # lazy: heavy package; rfdetr.util is gone since 1.9.0
 
         stage = context.stage if context is not None else None
         x = rgb_image.permute(0, 3, 1, 2)  # BHWC -> BCHW
